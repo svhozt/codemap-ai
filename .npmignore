@@ -1,0 +1,36 @@
+# Source files (only ship compiled dist/)
+src/
+tsconfig.json
+tsup.config.ts
+
+# Test files
+test-*.js
+
+# Documentation (keep README.md only)
+ARCHITECTURE_100_PERCENT.md
+IMPLEMENTATION_PLAN.md
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Web visualization (not part of CLI package)
+web/
+
+# Git
+.git/
+.gitignore
+
+# CI/CD
+.github/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# CodeMap data
+.codemap/
