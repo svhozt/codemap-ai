@@ -4,8 +4,16 @@
 
 import Parser from "tree-sitter";
 import Python from "tree-sitter-python";
-import { BaseParser } from "./base.js";
-import type { FileAnalysis, GraphNode, GraphEdge, ImportInfo, ExportInfo } from "../types.js";
+import { BaseParser, parseSource } from "./base.js";
+import type { FileAnalysis, GraphNode } from "../types.js";
+
+/** Largest source (in characters) we attempt to parse. */
+const MAX_SOURCE_LENGTH = 500_000;
+
+const HTTP_METHODS = new Set(["get", "post", "put", "patch", "delete", "options", "head"]);
+
+/** typing wrappers whose single argument is the interesting type. */
+const TYPE_WRAPPERS = /^(?:typing\.)?(?:Optional|List|Sequence|Iterable|Set|FrozenSet|Type|Annotated|Final|ClassVar|list|set|type)\[(.+)\]$/;
 
 export class PythonParser extends BaseParser {
   language = "python";
@@ -21,62 +29,30 @@ export class PythonParser extends BaseParser {
     this.treeSitterParser = this.parser; // Expose parser
   }
 
+  parseTree(_filePath: string, content: string): Parser.Tree | null {
+    const sourceCode = typeof content === "string" ? content : String(content);
+    if (sourceCode.length > MAX_SOURCE_LENGTH) return null;
+    try {
+      return parseSource(this.parser, sourceCode);
+    } catch {
+      return null;
+    }
+  }
+
   parse(filePath: string, content: string): FileAnalysis {
+    this.beginFile(filePath);
     const analysis = this.createEmptyAnalysis(filePath);
 
     // Ensure content is a string (not Buffer)
     const sourceCode = typeof content === "string" ? content : String(content);
 
-    // Skip extremely large files (>500KB) to prevent memory issues
-    if (sourceCode.length > 500000) {
-      const lines = sourceCode.split("\n");
-      const fileNode = this.createNode(
-        "file",
-        filePath.split("/").pop() || filePath,
-        filePath,
-        1,
-        lines.length
-      );
-      analysis.nodes.push(fileNode);
-      return analysis;
-    }
-
-    let tree;
-    try {
-      // Use callback-based parsing to avoid "Invalid argument" errors with large files
-      // This is more robust than passing the string directly
-      tree = this.parser.parse((index, position) => {
-        if (index >= sourceCode.length) {
-          return null;
-        }
-        const endIndex = Math.min(index + 1024, sourceCode.length);
-        return sourceCode.substring(index, endIndex);
-      });
-    } catch (error) {
-      // If parsing fails, just return the file node
-      const lines = sourceCode.split("\n");
-      const fileNode = this.createNode(
-        "file",
-        filePath.split("/").pop() || filePath,
-        filePath,
-        1,
-        lines.length
-      );
-      analysis.nodes.push(fileNode);
-      return analysis;
-    }
-
-    const lines = sourceCode.split("\n");
-
-    // Create file node
-    const fileNode = this.createNode(
-      "file",
-      filePath.split("/").pop() || filePath,
-      filePath,
-      1,
-      lines.length
-    );
+    const fileNode = this.createFileNode(filePath, sourceCode);
     analysis.nodes.push(fileNode);
+
+    // Very large or unparseable sources still get a file node, nothing more.
+    const tree = this.parseTree(filePath, sourceCode);
+    if (!tree) return analysis;
+    this.rememberTree(filePath, tree);
 
     // Walk the tree
     this.walkTree(tree.rootNode, filePath, analysis, fileNode.id);
@@ -110,6 +86,11 @@ export class PythonParser extends BaseParser {
       case "call":
         this.handleCall(node, filePath, analysis, parentId);
         break;
+
+      case "assignment":
+        // Module-level singletons: handler = UserHandler()
+        this.handleAssignment(node, filePath, analysis, parentId);
+        break;
     }
 
     // Recurse into children
@@ -119,26 +100,30 @@ export class PythonParser extends BaseParser {
   }
 
   private handleImport(node: Parser.SyntaxNode, analysis: FileAnalysis): void {
-    // import foo, bar, baz
-    for (const child of node.children) {
+    // import foo, bar.baz, qux as q
+    for (const child of node.namedChildren) {
       if (child.type === "dotted_name") {
+        // `import a.b.c` binds `a`, and the module is used as `a.b.c.func()`.
         analysis.imports.push({
           source: child.text,
-          specifiers: [child.text.split(".").pop() || child.text],
+          specifiers: [child.text],
           isDefault: false,
           isNamespace: true,
           line: node.startPosition.row + 1,
+          aliases: { [child.text]: "*" },
         });
       } else if (child.type === "aliased_import") {
         const nameNode = child.childForFieldName("name");
         const aliasNode = child.childForFieldName("alias");
         if (nameNode) {
+          const local = aliasNode?.text || nameNode.text;
           analysis.imports.push({
             source: nameNode.text,
-            specifiers: [aliasNode?.text || nameNode.text],
+            specifiers: [local],
             isDefault: false,
             isNamespace: true,
             line: node.startPosition.row + 1,
+            aliases: { [local]: "*" },
           });
         }
       }
@@ -146,41 +131,29 @@ export class PythonParser extends BaseParser {
   }
 
   private handleFromImport(node: Parser.SyntaxNode, analysis: FileAnalysis): void {
-    // from foo import bar, baz
+    // from foo import bar, baz as qux
     const moduleNode = node.childForFieldName("module_name");
     if (!moduleNode) return;
 
     const source = moduleNode.text;
     const specifiers: string[] = [];
+    const aliases: Record<string, string> = {};
 
-    for (const child of node.children) {
-      if (child.type === "import_prefix") {
-        // Handle relative imports (from . import x, from .. import y)
-        continue;
-      }
+    for (const child of node.namedChildren) {
+      if (child === moduleNode || child.id === moduleNode.id) continue;
 
-      if (child.type === "dotted_name" && child !== moduleNode) {
+      if (child.type === "dotted_name") {
         specifiers.push(child.text);
       } else if (child.type === "aliased_import") {
         const nameNode = child.childForFieldName("name");
+        const aliasNode = child.childForFieldName("alias");
         if (nameNode) {
-          specifiers.push(nameNode.text);
+          const local = aliasNode?.text || nameNode.text;
+          specifiers.push(local);
+          if (local !== nameNode.text) aliases[local] = nameNode.text;
         }
       } else if (child.type === "wildcard_import") {
         specifiers.push("*");
-      }
-    }
-
-    if (specifiers.length === 0) {
-      // Check for named imports in different structure
-      for (const child of node.children) {
-        if (child.type === "import_list" || child.type === "import_from_specifier") {
-          for (const spec of child.children) {
-            if (spec.type === "dotted_name" || spec.type === "identifier") {
-              specifiers.push(spec.text);
-            }
-          }
-        }
       }
     }
 
@@ -190,6 +163,7 @@ export class PythonParser extends BaseParser {
       isDefault: false,
       isNamespace: specifiers.includes("*"),
       line: node.startPosition.row + 1,
+      ...(Object.keys(aliases).length > 0 ? { aliases } : {}),
     });
   }
 
@@ -206,7 +180,12 @@ export class PythonParser extends BaseParser {
 
     // Check for decorators - they are siblings within parent decorated_definition
     const decorators: string[] = [];
-    const decoratorDetails: Array<{ name: string; args: string[]; kwargs?: Record<string, string> }> = [];
+    const decoratorDetails: Array<{
+      name: string;
+      args: string[];
+      argKinds?: string[];
+      kwargs?: Record<string, string>;
+    }> = [];
 
     // Check if parent is decorated_definition
     if (node.parent?.type === "decorated_definition") {
@@ -226,6 +205,7 @@ export class PythonParser extends BaseParser {
 
               // Extract arguments (both positional and keyword)
               const args: string[] = [];
+              const argKinds: string[] = [];
               const kwargs: Record<string, string> = {};
               const argList = decoratorCall.children.find((c) => c.type === "argument_list");
               if (argList) {
@@ -235,6 +215,7 @@ export class PythonParser extends BaseParser {
                     const stringContent = arg.children.find((c) => c.type === "string_content");
                     const argText = stringContent ? stringContent.text : arg.text.replace(/^["']|["']$/g, "");
                     args.push(argText);
+                    argKinds.push("string");
                   } else if (arg.type === "keyword_argument") {
                     // Keyword argument: tags=["orders"]
                     const keyNode = arg.childForFieldName("name");
@@ -258,11 +239,12 @@ export class PythonParser extends BaseParser {
                   } else if (arg.type === "identifier") {
                     // Positional identifier argument
                     args.push(arg.text);
+                    argKinds.push("identifier");
                   }
                 }
               }
 
-              decoratorDetails.push({ name: fullDecorator, args, kwargs });
+              decoratorDetails.push({ name: fullDecorator, args, argKinds, kwargs });
             }
           } else if (decoratorAttr) {
             // Simple decorator without arguments: @property
@@ -306,13 +288,13 @@ export class PythonParser extends BaseParser {
     analysis.edges.push(this.createEdge("contains", parentId, funcNode.id));
 
     // Check for FastAPI route decorators (@router.get, @router.post, etc.)
-    this.detectFastAPIRoute(decoratorDetails, funcNode, analysis);
+    this.detectFastAPIRoute(decoratorDetails, funcNode);
 
     // Parse function parameters for Depends() and type hints
     const parameters = node.childForFieldName("parameters");
     if (parameters) {
       this.detectDependsPattern(parameters, funcNode, analysis);
-      this.extractParameterTypes(parameters, funcNode.id, filePath, analysis);
+      this.extractParameterTypes(parameters, funcNode.id, analysis);
     }
 
     // Parse function body for calls
@@ -335,16 +317,27 @@ export class PythonParser extends BaseParser {
    * Detect FastAPI route decorators like @router.post("/orders")
    */
   private detectFastAPIRoute(
-    decoratorDetails: Array<{ name: string; args: string[]; kwargs?: Record<string, string> }>,
-    funcNode: GraphNode,
-    analysis: FileAnalysis
+    decoratorDetails: Array<{
+      name: string;
+      args: string[];
+      argKinds?: string[];
+      kwargs?: Record<string, string>;
+    }>,
+    funcNode: GraphNode
   ): void {
     for (const dec of decoratorDetails) {
-      // Match patterns: router.get, router.post, app.get, etc.
-      const routeMatch = dec.name.match(/^(router|app)\.(get|post|put|patch|delete|options|head)$/);
-      if (routeMatch && dec.args.length > 0) {
-        const method = routeMatch[2].toUpperCase();
-        const path = dec.args[0]; // First argument is the path
+      // Match patterns: router.get, app.post, api_router.put, v1.router.delete, etc.
+      const parts = dec.name.split(".");
+      const verb = parts[parts.length - 1];
+      const path = dec.args[0]; // First argument is the path
+      if (
+        parts.length >= 2 &&
+        HTTP_METHODS.has(verb) &&
+        dec.argKinds?.[0] === "string" &&
+        typeof path === "string" &&
+        (path === "" || path.startsWith("/"))
+      ) {
+        const method = verb.toUpperCase();
 
         // Store as metadata in the function node
         if (!funcNode.metadata) funcNode.metadata = {};
@@ -357,109 +350,94 @@ export class PythonParser extends BaseParser {
   }
 
   /**
-   * Detect Depends() pattern in function parameters
-   * Example: user: User = Depends(authenticate_user)
+   * Detect FastAPI dependency injection in function parameters.
+   * Examples:
+   *   user: User = Depends(authenticate_user)
+   *   user=Depends(get_user)
+   *   user: Annotated[User, Depends(get_user)]
    */
   private detectDependsPattern(
     parameters: Parser.SyntaxNode,
     funcNode: GraphNode,
     analysis: FileAnalysis
   ): void {
-    for (const param of parameters.children) {
-      if (param.type === "typed_parameter" || param.type === "default_parameter") {
-        // Look for default value
-        const defaultValue = param.children.find((c) => c.type === "call");
-        if (defaultValue) {
-          // Check if it's a Depends() call
-          const funcCall = defaultValue.childForFieldName("function");
-          if (funcCall && funcCall.text === "Depends") {
-            // Extract the argument to Depends()
-            const argList = defaultValue.childForFieldName("arguments");
-            if (argList) {
-              for (const arg of argList.children) {
-                if (arg.type === "identifier") {
-                  const dependencyName = arg.text;
+    for (const param of parameters.namedChildren) {
+      if (
+        param.type !== "typed_parameter" &&
+        param.type !== "default_parameter" &&
+        param.type !== "typed_default_parameter"
+      ) {
+        continue;
+      }
 
-                  // Get parameter name
-                  const paramName = param.children.find(
-                    (c) => c.type === "identifier"
-                  )?.text;
+      const paramName = (
+        param.childForFieldName("name") ?? param.namedChildren.find((c) => c.type === "identifier")
+      )?.text;
 
-                  // Store in metadata
-                  if (!funcNode.metadata) funcNode.metadata = {};
-                  if (!funcNode.metadata.depends) funcNode.metadata.depends = [];
-                  (funcNode.metadata.depends as any[]).push({
-                    parameterName: paramName,
-                    dependencyName,
-                    line: param.startPosition.row + 1,
-                  });
+      for (const call of findDescendants(param, "call")) {
+        const funcCall = call.childForFieldName("function");
+        const callee = funcCall?.text.split(".").pop();
+        if (callee !== "Depends" && callee !== "Security") continue;
 
-                  // Create an edge to represent this dependency
-                  // We'll use a special edge type that will be resolved later
-                  analysis.edges.push(
-                    this.createEdge("depends", funcNode.id, `ref:${dependencyName}`, {
-                      unresolvedName: dependencyName,
-                      parameterName: paramName,
-                      line: param.startPosition.row + 1,
-                    })
-                  );
-                }
-              }
-            }
-          }
-        }
+        const argList = call.childForFieldName("arguments");
+        const arg = argList?.namedChildren.find(
+          (c) => c.type === "identifier" || c.type === "attribute"
+        );
+        if (!arg) continue;
+
+        const dependencyName = arg.text;
+        const line = param.startPosition.row + 1;
+
+        if (!funcNode.metadata) funcNode.metadata = {};
+        if (!funcNode.metadata.depends) funcNode.metadata.depends = [];
+        (funcNode.metadata.depends as unknown[]).push({
+          parameterName: paramName,
+          dependencyName,
+          line,
+        });
+
+        // A "depends" edge, resolved later like any other reference.
+        analysis.edges.push(
+          this.createEdge("depends", funcNode.id, `ref:${dependencyName}`, {
+            unresolvedName: dependencyName,
+            parameterName: paramName,
+            line,
+          })
+        );
       }
     }
   }
 
   /**
    * Extract parameter type hints and register as variable types
-   * Example: def process(user: User, config: Config)
+   * Example: def process(user: User, config: Optional[Config] = None)
    */
   private extractParameterTypes(
     parameters: Parser.SyntaxNode,
     scopeId: string,
-    filePath: string,
     analysis: FileAnalysis
   ): void {
-    for (const param of parameters.children) {
-      if (param.type === "typed_parameter") {
-        // Get parameter name
-        const nameNode = param.children.find((c) => c.type === "identifier");
-        if (!nameNode) continue;
+    for (const param of parameters.namedChildren) {
+      if (param.type !== "typed_parameter" && param.type !== "typed_default_parameter") continue;
 
-        const paramName = nameNode.text;
+      const nameNode =
+        param.childForFieldName("name") ?? param.namedChildren.find((c) => c.type === "identifier");
+      const typeNode = param.childForFieldName("type");
+      if (!nameNode || !typeNode) continue;
 
-        // Skip self and cls
-        if (paramName === "self" || paramName === "cls") continue;
+      const paramName = nameNode.text;
+      if (paramName === "self" || paramName === "cls") continue;
 
-        // Get type annotation
-        const typeNode = param.children.find((c) => c.type === "type");
-        if (!typeNode) continue;
+      const typeName = simplifyTypeName(typeNode.text);
+      if (!typeName) continue;
 
-        let typeName = typeNode.text;
-
-        // Clean up type (remove quotes, Optional[], List[], etc.)
-        typeName = typeName.replace(/["']/g, "").trim();
-
-        // Extract base type from generics: Optional[User] -> User, List[Item] -> Item
-        const genericMatch = typeName.match(/(?:Optional|List|Dict|Set)\[([^\]]+)\]/);
-        if (genericMatch) {
-          typeName = genericMatch[1].trim();
-        }
-
-        // Store as variable type in function scope
-        if (!analysis.variableTypes) {
-          analysis.variableTypes = [];
-        }
-
-        analysis.variableTypes.push({
-          variableName: paramName,
-          typeName,
-          scopeId,
-          line: param.startPosition.row + 1,
-        });
-      }
+      if (!analysis.variableTypes) analysis.variableTypes = [];
+      analysis.variableTypes.push({
+        variableName: paramName,
+        typeName,
+        scopeId,
+        line: param.startPosition.row + 1,
+      });
     }
   }
 
@@ -514,7 +492,24 @@ export class PythonParser extends BaseParser {
     const body = node.childForFieldName("body");
     if (body) {
       for (const child of body.children) {
-        if (child.type === "function_definition") {
+        if (child.type === "expression_statement") {
+          // Annotated class attributes (dataclasses, pydantic models): repo: Repo
+          const assignment = child.namedChildren[0];
+          const target = assignment?.childForFieldName("left");
+          const annotation = assignment?.childForFieldName("type");
+          if (assignment?.type === "assignment" && target?.type === "identifier" && annotation) {
+            const typeName = simplifyTypeName(annotation.text);
+            if (typeName) {
+              if (!analysis.variableTypes) analysis.variableTypes = [];
+              analysis.variableTypes.push({
+                variableName: `self.${target.text}`,
+                typeName,
+                scopeId: classNode.id,
+                line: child.startPosition.row + 1,
+              });
+            }
+          }
+        } else if (child.type === "function_definition") {
           this.handleMethod(child, filePath, analysis, classNode.id);
         } else if (child.type === "decorated_definition") {
           // Handle decorated methods (@classmethod, @staticmethod, @property, etc.)
@@ -592,31 +587,32 @@ export class PythonParser extends BaseParser {
     analysis.nodes.push(methodNode);
     analysis.edges.push(this.createEdge("contains", classId, methodNode.id));
 
+    const parameters = node.childForFieldName("parameters");
+    if (parameters) {
+      this.extractParameterTypes(parameters, methodNode.id, analysis);
+    }
+
     // Parse method body for calls
     const body = node.childForFieldName("body");
     if (body) {
-      this.parseBodyForCalls(body, filePath, analysis, methodNode.id);
+      this.parseBodyForCalls(body, filePath, analysis, methodNode.id, classId);
     }
   }
 
   private handleCall(
     node: Parser.SyntaxNode,
-    filePath: string,
+    _filePath: string,
     analysis: FileAnalysis,
     parentId: string
   ): void {
     const funcNode = node.childForFieldName("function");
     if (!funcNode) return;
 
-    let calledName = "";
-    if (funcNode.type === "identifier") {
-      calledName = funcNode.text;
-    } else if (funcNode.type === "attribute") {
-      // Get the full attribute access (e.g., "self.method", "module.func")
-      calledName = funcNode.text;
-    }
+    // "func", "self.method", "module.func", "super().method", "?.method"
+    const calledName = pythonCalleeName(funcNode);
 
-    if (calledName) {
+    // `super()` itself only looks up the parent class; the call that matters is `super().method()`.
+    if (calledName && calledName !== "super") {
       // Track all calls including self.method for proper resolution
       analysis.edges.push(
         this.createEdge("calls", parentId, `ref:${calledName}`, {
@@ -685,7 +681,8 @@ export class PythonParser extends BaseParser {
     body: Parser.SyntaxNode,
     filePath: string,
     analysis: FileAnalysis,
-    parentId: string
+    parentId: string,
+    classId?: string
   ): void {
     const walkForCalls = (node: Parser.SyntaxNode): void => {
       if (node.type === "call") {
@@ -698,7 +695,7 @@ export class PythonParser extends BaseParser {
         this.handleFromImport(node, analysis);
       } else if (node.type === "assignment") {
         // Track variable assignments for type inference
-        this.handleAssignment(node, filePath, analysis, parentId);
+        this.handleAssignment(node, filePath, analysis, parentId, classId);
       }
       for (const child of node.children) {
         walkForCalls(child);
@@ -710,74 +707,182 @@ export class PythonParser extends BaseParser {
   /**
    * Handle variable assignments to track types
    * Examples:
-   *   user = get_user(id)           # Track if get_user has type hint
-   *   handler = UserHandler(db)     # Track: handler -> UserHandler
-   *   cfg = Config.load()  # Track: cfg -> Config
+   *   user = get_user(id)                  # user -> @call:get_user
+   *   handler = UserHandler(db)            # handler -> UserHandler
+   *   handler: UserHandler = make()        # handler -> UserHandler
+   *   cfg = Config.load()                  # cfg -> Config
+   *   self.repo = Repo(db)                 # self.repo -> Repo (on the class)
+   *   self.db = db                         # self.db -> type of parameter `db`
    */
   private handleAssignment(
     node: Parser.SyntaxNode,
-    filePath: string,
+    _filePath: string,
     analysis: FileAnalysis,
-    scopeId: string
+    scopeId: string,
+    classId?: string
   ): void {
-    // Get left side (variable name)
     const leftNode = node.childForFieldName("left");
-    if (!leftNode || leftNode.type !== "identifier") return;
+    if (!leftNode) return;
 
-    const variableName = leftNode.text;
+    let variableName: string;
+    let typeScope = scopeId;
 
-    // Get right side (value being assigned)
-    const rightNode = node.childForFieldName("right");
-    if (!rightNode) return;
+    if (leftNode.type === "identifier") {
+      variableName = leftNode.text;
+    } else if (
+      classId &&
+      leftNode.type === "attribute" &&
+      leftNode.childForFieldName("object")?.text === "self" &&
+      leftNode.childForFieldName("attribute")
+    ) {
+      // Instance attribute: stored against the class so every method can use it.
+      variableName = `self.${leftNode.childForFieldName("attribute")!.text}`;
+      typeScope = classId;
+    } else {
+      return;
+    }
 
     let typeName: string | null = null;
 
-    // Pattern 1: Direct class instantiation - handler = UserHandler(...)
-    if (rightNode.type === "call") {
-      const funcNode = rightNode.childForFieldName("function");
-      if (funcNode) {
-        if (funcNode.type === "identifier") {
-          // Simple: ClassName(...) or function_call()
-          const funcName = funcNode.text;
+    // Explicit annotation wins: handler: UserHandler = ...
+    const annotation = node.childForFieldName("type");
+    if (annotation) {
+      typeName = simplifyTypeName(annotation.text);
+    }
 
-          // Check if it's a known class (starts with capital) - instant assign
-          if (funcName[0] === funcName[0].toUpperCase()) {
+    const rightNode = node.childForFieldName("right");
+    if (!typeName && rightNode) {
+      let value = rightNode;
+      if (value.type === "await") {
+        value = value.namedChildren[0] ?? value;
+      }
+
+      if (value.type === "call") {
+        const funcNode = value.childForFieldName("function");
+        const funcName = funcNode ? pythonCalleeName(funcNode) : null;
+        if (funcName && !funcName.startsWith("?")) {
+          const parts = funcName.split(".");
+          const head = parts[0];
+          if (parts.length === 1) {
+            // ClassName(...) is an instance; anything else is a plain call.
+            typeName = isCapitalized(head) ? head : `@call:${funcName}`;
+          } else if (isCapitalized(head) && parts.length === 2) {
+            // ClassName.factory() conventionally returns an instance of the class.
+            typeName = head;
+          } else if (isCapitalized(parts[parts.length - 1])) {
+            // module.ClassName(...)
             typeName = funcName;
           } else {
-            // It's a function call - we'll need to look up return type later
-            // Store as a pending type resolution
             typeName = `@call:${funcName}`;
           }
-        } else if (funcNode.type === "attribute") {
-          // Class method: ClassName.method()
-          const parts = funcNode.text.split(".");
-          if (parts.length >= 2) {
-            const className = parts[0];
-            const methodName = parts[1];
-
-            // If className is capitalized, assume the method returns that class type
-            if (className[0] === className[0].toUpperCase()) {
-              typeName = className;
-            } else {
-              // Store for later resolution
-              typeName = `@call:${funcNode.text}`;
-            }
-          }
         }
+      } else if (value.type === "identifier" && typeScope !== scopeId) {
+        // self.db = db  -> reuse the type hint of the parameter
+        const known = analysis.variableTypes?.find(
+          (v) => v.scopeId === scopeId && v.variableName === value.text
+        );
+        if (known && !known.typeName.startsWith("@call:")) typeName = known.typeName;
       }
     }
 
-    if (typeName && !analysis.variableTypes) {
-      analysis.variableTypes = [];
-    }
+    if (!typeName) return;
+    // Call results are only useful for local variables.
+    if (typeScope !== scopeId && typeName.startsWith("@call:")) return;
 
-    if (typeName) {
-      analysis.variableTypes!.push({
-        variableName,
-        typeName,
-        scopeId,
-        line: node.startPosition.row + 1,
-      });
+    if (!analysis.variableTypes) analysis.variableTypes = [];
+    analysis.variableTypes.push({
+      variableName,
+      typeName,
+      scopeId: typeScope,
+      line: node.startPosition.row + 1,
+    });
+  }
+}
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+function isCapitalized(name: string): boolean {
+  const first = name[0];
+  return !!first && first !== first.toLowerCase() && first === first.toUpperCase();
+}
+
+function findDescendants(node: Parser.SyntaxNode, type: string): Parser.SyntaxNode[] {
+  const found: Parser.SyntaxNode[] = [];
+  const walk = (n: Parser.SyntaxNode): void => {
+    if (n.type === type) found.push(n);
+    for (const child of n.namedChildren) walk(child);
+  };
+  walk(node);
+  return found;
+}
+
+/**
+ * Reduce a type hint to the class it names:
+ *   "User" -> User, Optional[User] -> User, List[Item] -> Item,
+ *   User | None -> User, Annotated[User, Depends(x)] -> User
+ * Returns null for hints that do not name a single class (Dict[str, int], Union[A, B]...).
+ */
+export function simplifyTypeName(raw: string): string | null {
+  let typeName = raw.replace(/["']/g, "").trim();
+
+  for (let i = 0; i < 5; i++) {
+    const wrapped = typeName.match(TYPE_WRAPPERS);
+    if (!wrapped) break;
+    // Annotated[User, ...] keeps only the first argument.
+    typeName = splitTopLevel(wrapped[1])[0].trim();
+  }
+
+  // X | None  /  None | X
+  const unionParts = typeName.split("|").map((p) => p.trim()).filter((p) => p && p !== "None");
+  if (unionParts.length !== 1) return null;
+  typeName = unionParts[0];
+
+  return /^[A-Za-z_][\w.]*$/.test(typeName) ? typeName : null;
+}
+
+/** Split "A, B[C, D], E" on commas that are not inside brackets. */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of text) {
+    if (ch === "[" || ch === "(") depth++;
+    else if (ch === "]" || ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+    } else {
+      current += ch;
     }
   }
+  parts.push(current);
+  return parts;
+}
+
+/**
+ * Dotted name of a callee expression.
+ *   foo -> "foo", self.repo.save -> "self.repo.save", super().run -> "super().run",
+ *   get_db().query -> "?.query" (receiver is not a plain name)
+ */
+export function pythonCalleeName(node: Parser.SyntaxNode): string | null {
+  if (node.type === "identifier") return node.text;
+  if (node.type === "attribute") {
+    const object = node.childForFieldName("object");
+    const attribute = node.childForFieldName("attribute");
+    if (!object || !attribute) return null;
+    if (object.type === "call") {
+      const fn = object.childForFieldName("function");
+      const args = object.childForFieldName("arguments");
+      if (fn?.text === "super" && (args?.namedChildren.length ?? 0) <= 2) {
+        return `super().${attribute.text}`;
+      }
+      return `?.${attribute.text}`;
+    }
+    const receiver = pythonCalleeName(object);
+    if (!receiver || receiver.startsWith("?")) return `?.${attribute.text}`;
+    return `${receiver}.${attribute.text}`;
+  }
+  return null;
 }
