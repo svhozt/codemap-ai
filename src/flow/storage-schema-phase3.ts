@@ -58,6 +58,9 @@ export function createPhase3Tables(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_property_accesses_scope
       ON property_accesses(scope_node_id);
 
+    CREATE INDEX IF NOT EXISTS idx_property_accesses_file
+      ON property_accesses(file_path);
+
     CREATE INDEX IF NOT EXISTS idx_return_shapes_function
       ON return_shapes(function_id);
 
@@ -66,16 +69,5 @@ export function createPhase3Tables(db: Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_data_flows_target
       ON data_flows(target_id);
-  `);
-}
-
-/**
- * Drop Phase 3 tables (for testing/cleanup)
- */
-export function dropPhase3Tables(db: Database): void {
-  db.exec(`
-    DROP TABLE IF EXISTS data_flows;
-    DROP TABLE IF EXISTS return_shapes;
-    DROP TABLE IF EXISTS property_accesses;
   `);
 }

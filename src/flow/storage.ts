@@ -21,12 +21,46 @@ export interface CallPath {
   }>;
 }
 
+/** A symbol found by {@link FlowStorage.findSymbols}. */
+export interface SymbolMatch extends GraphNode {
+  /** How the query matched: exact name, qualified name, case-insensitive, or substring. */
+  match: "exact" | "qualified" | "case-insensitive" | "partial";
+}
+
+/**
+ * Bump when the meaning of stored data changes in a way that makes indexes
+ * written by older versions unreliable. Older indexes are rebuilt on demand.
+ *
+ *   1 - codemap-ai <= 3.8.0 (edge ids collided across files and languages)
+ *   2 - per-file edge ids, scoped TS/JS calls, exact-name resolution
+ */
+export const INDEX_FORMAT_VERSION = 2;
+
 export class FlowStorage {
   public db: Database.Database; // Public for builder to access
 
+  private statements = new Map<string, Database.Statement>();
+
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
+    // Wait briefly instead of failing when the CLI and the MCP server touch the file at once.
+    this.db.pragma("busy_timeout = 5000");
     this.initSchema();
+  }
+
+  /** Prepare a statement once and reuse it. */
+  private stmt(sql: string): Database.Statement {
+    let statement = this.statements.get(sql);
+    if (!statement) {
+      statement = this.db.prepare(sql);
+      this.statements.set(sql, statement);
+    }
+    return statement;
+  }
+
+  /** Run `fn` inside a single transaction (much faster for bulk writes). */
+  transaction<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
   }
 
   private initSchema(): void {
@@ -160,6 +194,12 @@ export class FlowStorage {
         metadata TEXT
       );
 
+      -- Key/value settings (index format version, include/exclude patterns)
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
       -- Indexes for fast queries
       CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_path);
       CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
@@ -175,16 +215,79 @@ export class FlowStorage {
       CREATE INDEX IF NOT EXISTS idx_framework_deps_target ON framework_dependencies(target_node_id);
       CREATE INDEX IF NOT EXISTS idx_variable_types_scope ON variable_types(scope_node_id, variable_name);
       CREATE INDEX IF NOT EXISTS idx_variable_types_file ON variable_types(file_path, variable_name);
+      CREATE INDEX IF NOT EXISTS idx_http_endpoints_handler ON http_endpoints(handler_node_id);
+      CREATE INDEX IF NOT EXISTS idx_database_operations_node ON database_operations(node_id);
     `);
 
     // Create Phase 3 tables
     createPhase3Tables(this.db);
+
+    // Columns added after the first release of this schema.
+    const importColumns = this.db.prepare("PRAGMA table_info(imports)").all() as Array<{ name: string }>;
+    if (!importColumns.some((c) => c.name === "original_name")) {
+      this.db.exec("ALTER TABLE imports ADD COLUMN original_name TEXT");
+    }
+    if (!importColumns.some((c) => c.name === "is_reexport")) {
+      this.db.exec("ALTER TABLE imports ADD COLUMN is_reexport INTEGER DEFAULT 0");
+    }
+  }
+
+  // ============ Meta ============
+
+  getMeta(key: string): string | null {
+    const row = this.stmt("SELECT value FROM meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value ?? null;
+  }
+
+  setMeta(key: string, value: string): void {
+    this.stmt("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, value);
+  }
+
+  /** Format version of the stored index (1 for indexes written before versions were recorded). */
+  getIndexFormatVersion(): number {
+    const value = this.getMeta("index_format_version");
+    return value ? Number(value) : 1;
+  }
+
+  markIndexFormatCurrent(): void {
+    this.setMeta("index_format_version", String(INDEX_FORMAT_VERSION));
+  }
+
+  /**
+   * True when the database holds an index written by an older, incompatible
+   * version of codemap-ai. Such an index must be rebuilt (`codemap reindex`).
+   */
+  isIndexOutdated(): boolean {
+    if (this.getIndexFormatVersion() >= INDEX_FORMAT_VERSION) return false;
+    const row = this.stmt("SELECT COUNT(*) as count FROM files").get() as { count: number };
+    return row.count > 0;
+  }
+
+  /** Include/exclude patterns the index was last built with. */
+  getIndexPatterns(): { include: string[]; exclude: string[] } | null {
+    const value = this.getMeta("index_patterns");
+    if (!value) return null;
+    try {
+      const parsed = JSON.parse(value) as { include?: unknown; exclude?: unknown };
+      if (Array.isArray(parsed.include) && Array.isArray(parsed.exclude)) {
+        return { include: parsed.include as string[], exclude: parsed.exclude as string[] };
+      }
+    } catch {
+      // fall through
+    }
+    return null;
+  }
+
+  setIndexPatterns(include: string[], exclude: string[]): void {
+    this.setMeta("index_patterns", JSON.stringify({ include, exclude }));
   }
 
   // ============ Node Operations ============
 
   insertNode(node: GraphNode & { hash?: string }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO nodes (id, type, name, file_path, start_line, end_line, language, hash, metadata)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
@@ -202,20 +305,76 @@ export class FlowStorage {
   }
 
   getNode(id: string): GraphNode | null {
-    const stmt = this.db.prepare("SELECT * FROM nodes WHERE id = ?");
+    const stmt = this.stmt("SELECT * FROM nodes WHERE id = ?");
     const row = stmt.get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
     return this.rowToNode(row);
   }
 
+  /**
+   * Nodes whose name equals or contains `name`. Exact matches come first.
+   *
+   * This is a loose text search. To look up the symbol a user means, use
+   * {@link findSymbols}, which never falls back to substrings when an exact
+   * match exists and never returns file nodes.
+   */
   searchNodesByName(name: string): GraphNode[] {
-    const stmt = this.db.prepare("SELECT * FROM nodes WHERE name = ? OR name LIKE ?");
-    const rows = stmt.all(name, `%${name}%`) as Record<string, unknown>[];
+    const stmt = this.stmt(`
+      SELECT * FROM nodes
+      WHERE name = ? OR name LIKE ? ESCAPE '\\'
+      ORDER BY (name = ?) DESC, (type = 'file') ASC, file_path, start_line
+    `);
+    const rows = stmt.all(name, `%${escapeLike(name)}%`, name) as Record<string, unknown>[];
     return rows.map((r) => this.rowToNode(r));
   }
 
+  /**
+   * Find the functions, methods and classes a user means by `query`.
+   *
+   * Accepts a bare name (`authenticate`), a qualified name (`UserService.authenticate`)
+   * and, as a fallback, a case-insensitive or partial name. The best matching
+   * tier wins: if anything matches exactly, looser matches are not returned.
+   */
+  findSymbols(query: string, limit = 50): SymbolMatch[] {
+    const wanted = query.trim().replace(/\(\)$/, "");
+    if (!wanted) return [];
+
+    const tag = (rows: Record<string, unknown>[], match: SymbolMatch["match"]): SymbolMatch[] =>
+      rows.map((r) => ({ ...this.rowToNode(r), match }));
+    const order = "ORDER BY (type = 'variable') ASC, file_path, start_line LIMIT ?";
+
+    // Qualified: Class.method
+    const dot = wanted.lastIndexOf(".");
+    if (dot > 0) {
+      const owner = wanted.slice(0, dot).split(".").pop()!;
+      const member = wanted.slice(dot + 1);
+      const rows = this.stmt(`
+        SELECT * FROM nodes
+        WHERE name = ? AND type != 'file'
+          AND (json_extract(metadata, '$.parentClass') = ? OR json_extract(metadata, '$.memberOf') = ?)
+        ${order}
+      `).all(member, owner, owner, limit) as Record<string, unknown>[];
+      if (rows.length > 0) return tag(rows, "qualified");
+    }
+
+    const exact = this.stmt(
+      `SELECT * FROM nodes WHERE name = ? AND type != 'file' ${order}`
+    ).all(wanted, limit) as Record<string, unknown>[];
+    if (exact.length > 0) return tag(exact, "exact");
+
+    const insensitive = this.stmt(
+      `SELECT * FROM nodes WHERE name = ? COLLATE NOCASE AND type != 'file' ${order}`
+    ).all(wanted, limit) as Record<string, unknown>[];
+    if (insensitive.length > 0) return tag(insensitive, "case-insensitive");
+
+    const partial = this.stmt(
+      `SELECT * FROM nodes WHERE name LIKE ? ESCAPE '\\' AND type != 'file' ${order}`
+    ).all(`%${escapeLike(wanted)}%`, limit) as Record<string, unknown>[];
+    return tag(partial, "partial");
+  }
+
   getNodesByFile(filePath: string): GraphNode[] {
-    const stmt = this.db.prepare("SELECT * FROM nodes WHERE file_path = ?");
+    const stmt = this.stmt("SELECT * FROM nodes WHERE file_path = ?");
     const rows = stmt.all(filePath) as Record<string, unknown>[];
     return rows.map((r) => this.rowToNode(r));
   }
@@ -236,7 +395,7 @@ export class FlowStorage {
   // ============ Edge Operations ============
 
   insertEdge(edge: GraphEdge): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO edges (id, type, source_id, target_id, metadata)
       VALUES (?, ?, ?, ?, ?)
     `);
@@ -255,10 +414,11 @@ export class FlowStorage {
    * Get all resolved callees (functions this node calls)
    */
   getResolvedCallees(nodeId: string): GraphNode[] {
-    const stmt = this.db.prepare(`
-      SELECT n.* FROM nodes n
+    const stmt = this.stmt(`
+      SELECT DISTINCT n.* FROM nodes n
       JOIN edges e ON n.id = e.target_id
       WHERE e.source_id = ? AND e.type = 'calls' AND e.target_id NOT LIKE 'ref:%'
+      ORDER BY n.file_path, n.start_line
     `);
     const rows = stmt.all(nodeId) as Record<string, unknown>[];
     return rows.map((r) => this.rowToNode(r));
@@ -268,10 +428,11 @@ export class FlowStorage {
    * Get all resolved callers (functions that call this node)
    */
   getResolvedCallers(nodeId: string): GraphNode[] {
-    const stmt = this.db.prepare(`
-      SELECT n.* FROM nodes n
+    const stmt = this.stmt(`
+      SELECT DISTINCT n.* FROM nodes n
       JOIN edges e ON n.id = e.source_id
       WHERE e.target_id = ? AND e.type = 'calls'
+      ORDER BY n.file_path, n.start_line
     `);
     const rows = stmt.all(nodeId) as Record<string, unknown>[];
     return rows.map((r) => this.rowToNode(r));
@@ -281,23 +442,23 @@ export class FlowStorage {
    * Get impact: all nodes affected by changes to this node (BFS traversal)
    */
   getImpactedNodes(nodeId: string, maxDepth: number = 3): GraphNode[] {
-    const visited = new Set<string>();
+    // `seen` holds every node already reported or queued, so a caller reached
+    // through several paths is returned once.
+    const seen = new Set<string>([nodeId]);
     const result: GraphNode[] = [];
-    const queue: Array<{ id: string; depth: number }> = [{ id: nodeId, depth: 0 }];
+    let frontier: string[] = [nodeId];
 
-    while (queue.length > 0) {
-      const { id, depth } = queue.shift()!;
-
-      if (visited.has(id) || depth > maxDepth) continue;
-      visited.add(id);
-
-      const callers = this.getResolvedCallers(id);
-      for (const caller of callers) {
-        if (!visited.has(caller.id)) {
+    for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
+      const next: string[] = [];
+      for (const id of frontier) {
+        for (const caller of this.getResolvedCallers(id)) {
+          if (seen.has(caller.id)) continue;
+          seen.add(caller.id);
           result.push(caller);
-          queue.push({ id: caller.id, depth: depth + 1 });
+          next.push(caller.id);
         }
       }
+      frontier = next;
     }
 
     return result;
@@ -328,10 +489,10 @@ export class FlowStorage {
         const nodes = path.map((id) => {
           const n = this.getNode(id);
           return {
-            id: n!.id,
-            name: n!.name,
-            file: n!.filePath,
-            line: n!.startLine,
+            id,
+            name: n?.name ?? id,
+            file: n?.filePath ?? "",
+            line: n?.startLine ?? 0,
           };
         });
 
@@ -365,21 +526,38 @@ export class FlowStorage {
   // ============ Export/Import Tracking ============
 
   registerExport(filePath: string, symbolName: string, nodeId: string): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO exports (file_path, symbol_name, node_id)
       VALUES (?, ?, ?)
     `);
     stmt.run(filePath, symbolName, nodeId);
   }
 
-  registerImport(filePath: string, symbol: string, fromModule: string, line: number): void {
-    const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO imports (file_path, imported_symbol, from_module, line)
-      VALUES (?, ?, ?, ?)
+  /**
+   * Record that `filePath` binds the local name `symbol` to something from `fromModule`.
+   * `originalName` is the name inside that module when it differs from the
+   * local name ("default" for default imports, "*" for whole-module bindings).
+   */
+  registerImport(
+    filePath: string,
+    symbol: string,
+    fromModule: string,
+    line: number,
+    originalName?: string | null,
+    isReExport = false
+  ): void {
+    const stmt = this.stmt(`
+      INSERT INTO imports (file_path, imported_symbol, from_module, line, original_name, is_reexport)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
-    stmt.run(filePath, symbol, fromModule, line);
+    stmt.run(filePath, symbol, fromModule, line, originalName ?? null, isReExport ? 1 : 0);
   }
 
+  /**
+   * @deprecated Kept for programmatic users of earlier versions. Indexing now resolves
+   * references with `CallResolver` (src/flow/resolver.ts), which also follows aliases,
+   * re-exports and TypeScript modules.
+   */
   resolveImport(filePath: string, symbol: string): string | null {
     // Get the import statement
     const importStmt = this.db.prepare(`
@@ -475,6 +653,10 @@ export class FlowStorage {
   /**
    * Resolve a class method call like ClassName.method_name
    * Handles: static methods, class methods, imported classes
+   *
+   * @deprecated Kept for programmatic users of earlier versions. Indexing now resolves
+   * references with `CallResolver` (src/flow/resolver.ts), which also follows aliases,
+   * re-exports and TypeScript modules.
    */
   resolveClassMethod(className: string, methodName: string, callerFilePath: string): string | null {
     // Strategy 1: Check if the class is imported in the caller file
@@ -548,7 +730,7 @@ export class FlowStorage {
     isParameter: boolean = false
   ): void {
     const id = `${scopeNodeId}:var:${variableName}`;
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO variable_types
         (id, variable_name, type_name, scope_node_id, file_path, line, is_parameter)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -559,6 +741,10 @@ export class FlowStorage {
   /**
    * Resolve variable.method to actual method node
    * Example: user.get_name() where user is of type User
+   *
+   * @deprecated Kept for programmatic users of earlier versions. Indexing now resolves
+   * references with `CallResolver` (src/flow/resolver.ts), which also follows aliases,
+   * re-exports and TypeScript modules.
    */
   resolveVariableMethod(variableName: string, methodName: string, scopeNodeId: string): string | null {
     // Special case: self.method calls - resolve to methods in parent class
@@ -606,6 +792,10 @@ export class FlowStorage {
 
   /**
    * Resolve super().method() calls to parent class methods
+   *
+   * @deprecated Kept for programmatic users of earlier versions. Indexing now resolves
+   * references with `CallResolver` (src/flow/resolver.ts), which also follows aliases,
+   * re-exports and TypeScript modules.
    */
   resolveSuperMethod(methodName: string, scopeNodeId: string): string | null {
     // Find the parent class of the current method
@@ -662,7 +852,7 @@ export class FlowStorage {
   // ============ File Operations ============
 
   upsertFile(filePath: string, language: string, hash: string): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO files (path, language, hash, analyzed_at)
       VALUES (?, ?, ?, ?)
     `);
@@ -670,16 +860,63 @@ export class FlowStorage {
   }
 
   getFileHash(filePath: string): string | null {
-    const stmt = this.db.prepare("SELECT hash FROM files WHERE path = ?");
+    const stmt = this.stmt("SELECT hash FROM files WHERE path = ?");
     const row = stmt.get(filePath) as { hash: string } | undefined;
     return row?.hash || null;
   }
 
+  /**
+   * Remove everything the index knows about one file.
+   *
+   * Edges from *other* files that pointed at a symbol in this file are turned
+   * back into unresolved references, so the next resolution pass can re-attach
+   * them (to the re-parsed symbol, or to nothing if it no longer exists).
+   */
   deleteFileData(filePath: string): void {
-    this.db.prepare("DELETE FROM nodes WHERE file_path = ?").run(filePath);
-    this.db.prepare("DELETE FROM exports WHERE file_path = ?").run(filePath);
-    this.db.prepare("DELETE FROM imports WHERE file_path = ?").run(filePath);
-    this.db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
+    const inFile = "(SELECT id FROM nodes WHERE file_path = ?)";
+
+    this.transaction(() => {
+      // Incoming references from other files -> back to "ref:<name>".
+      this.stmt(`
+        UPDATE edges
+        SET target_id = 'ref:' || json_extract(metadata, '$.unresolvedName')
+        WHERE target_id IN ${inFile}
+          AND source_id NOT IN ${inFile}
+          AND json_extract(metadata, '$.unresolvedName') IS NOT NULL
+      `).run(filePath, filePath);
+      // Incoming edges that cannot be re-resolved by name (derived dependency edges).
+      this.stmt(`
+        DELETE FROM edges
+        WHERE target_id IN ${inFile} AND source_id NOT IN ${inFile}
+      `).run(filePath, filePath);
+      this.stmt(`
+        UPDATE framework_dependencies SET target_node_id = NULL
+        WHERE target_node_id IN ${inFile}
+      `).run(filePath);
+
+      // Everything that originates in this file.
+      this.stmt(`DELETE FROM edges WHERE source_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM http_endpoints WHERE handler_node_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM http_calls WHERE source_node_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM framework_dependencies WHERE source_node_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM database_operations WHERE node_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM message_queue_operations WHERE node_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM return_shapes WHERE function_id IN ${inFile}`).run(filePath);
+      this.stmt(`DELETE FROM property_accesses WHERE scope_node_id IN ${inFile}`).run(filePath);
+      this.stmt("DELETE FROM property_accesses WHERE file_path = ?").run(filePath);
+      this.stmt("DELETE FROM variable_types WHERE file_path = ?").run(filePath);
+
+      this.stmt("DELETE FROM nodes WHERE file_path = ?").run(filePath);
+      this.stmt("DELETE FROM exports WHERE file_path = ?").run(filePath);
+      this.stmt("DELETE FROM imports WHERE file_path = ?").run(filePath);
+      this.stmt("DELETE FROM files WHERE path = ?").run(filePath);
+    });
+  }
+
+  /** Paths of every indexed file. */
+  getIndexedFiles(): string[] {
+    const rows = this.stmt("SELECT path FROM files ORDER BY path").all() as Array<{ path: string }>;
+    return rows.map((r) => r.path);
   }
 
   // ============ Stats ============
@@ -788,7 +1025,7 @@ export class FlowStorage {
     middleware?: string[];
     metadata?: Record<string, unknown>;
   }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO http_endpoints (id, method, path, handler_node_id, container_id, middleware, metadata)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
@@ -812,7 +1049,7 @@ export class FlowStorage {
     line?: number;
     metadata?: Record<string, unknown>;
   }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO database_operations (id, node_id, database_type, operation, collection, line, metadata)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
@@ -855,7 +1092,7 @@ export class FlowStorage {
     unresolved_name?: string;
     metadata?: Record<string, unknown>;
   }): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.stmt(`
       INSERT OR REPLACE INTO framework_dependencies
       (id, source_node_id, target_node_id, framework, pattern, parameter_name, line, unresolved_name, metadata)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -920,6 +1157,10 @@ export class FlowStorage {
       DELETE FROM framework_dependencies;
       DELETE FROM database_operations;
       DELETE FROM message_queue_operations;
+      DELETE FROM variable_types;
+      DELETE FROM property_accesses;
+      DELETE FROM return_shapes;
+      DELETE FROM data_flows;
     `);
   }
 
@@ -940,7 +1181,7 @@ export class FlowStorage {
    * Get all nodes (for impact comparison)
    */
   getAllNodes(): Array<{ id: string; name: string; type: string; filePath: string }> {
-    const stmt = this.db.prepare("SELECT id, name, type, file_path FROM nodes");
+    const stmt = this.db.prepare("SELECT id, name, type, file_path AS filePath FROM nodes");
     return stmt.all() as Array<{ id: string; name: string; type: string; filePath: string }>;
   }
 
@@ -957,10 +1198,11 @@ export class FlowStorage {
    */
   getResolvedCallersWithLocation(nodeId: string): Array<{ id: string; name: string; file: string; line: number }> {
     const stmt = this.db.prepare(`
-      SELECT n.id, n.name, n.file_path as file, n.start_line as line
+      SELECT DISTINCT n.id, n.name, n.file_path as file, n.start_line as line
       FROM edges e
       JOIN nodes n ON e.source_id = n.id
       WHERE e.target_id = ? AND e.type = 'calls' AND e.target_id NOT LIKE 'ref:%'
+      ORDER BY n.file_path, n.start_line
     `);
     return stmt.all(nodeId) as Array<{ id: string; name: string; file: string; line: number }>;
   }
@@ -974,6 +1216,12 @@ export class FlowStorage {
   }
 
   close(): void {
+    this.statements.clear();
     this.db.close();
   }
+}
+
+/** Escape `%`, `_` and `\\` so user text can be used inside a LIKE pattern. */
+function escapeLike(text: string): string {
+  return text.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
