@@ -3,9 +3,9 @@
  * Re-parses files to extract Phase 3 data (property accesses, return shapes)
  */
 
-import Parser from "tree-sitter";
+import type Parser from "tree-sitter";
 import { readFileSync } from "fs";
-import { Database } from "better-sqlite3";
+import type { Database } from "better-sqlite3";
 import { extractPropertyAccesses } from "../analysis/property-tracker.js";
 import { analyzeReturnStatements } from "../analysis/return-analyzer.js";
 import {
@@ -15,26 +15,26 @@ import {
 import { parserRegistry } from "../parsers/index.js";
 
 /**
- * Analyze a file for Phase 3 data
+ * Analyze a file for Phase 3 data.
+ *
+ * `tree` is the syntax tree the parser already produced for this file; when it
+ * is not supplied the file is read and parsed again.
  */
 export function analyzeFileForPhase3(
   filePath: string,
   functionNodes: Array<{ id: string; name: string; startLine: number; endLine: number }>,
-  db: Database
+  db: Database,
+  tree?: Parser.Tree | null
 ): void {
   try {
-    // Get language from extension
-    const language = getLanguageFromPath(filePath);
-    if (!language) return;
-
-    // Get parser
-    const parserInstance = parserRegistry.getByLanguage(language);
-    if (!parserInstance || !parserInstance.treeSitterParser) return;
-
-    // Parse file using tree-sitter
-    const content = readFileSync(filePath, "utf-8");
-    const tree = parserInstance.treeSitterParser.parse(content);
-    const rootNode = tree.rootNode;
+    let syntaxTree = tree ?? null;
+    if (!syntaxTree) {
+      const parserInstance = parserRegistry.getForFile(filePath);
+      if (!parserInstance?.parseTree) return;
+      syntaxTree = parserInstance.parseTree(filePath, readFileSync(filePath, "utf-8"));
+    }
+    if (!syntaxTree) return;
+    const rootNode = syntaxTree.rootNode;
 
     // Analyze each function
     for (const func of functionNodes) {
@@ -56,26 +56,15 @@ export function analyzeFileForPhase3(
         storeReturnInfo(db, returns);
       }
     }
-  } catch (error) {
-    // Silently skip files that fail Phase 3 analysis
-    // Don't break the build if Phase 3 fails
+  } catch {
+    // Data-flow analysis is best effort: a failure here must never fail indexing.
   }
-}
-
-/**
- * Get language from file path
- */
-function getLanguageFromPath(filePath: string): string | null {
-  if (filePath.endsWith(".py")) return "python";
-  if (filePath.endsWith(".js") || filePath.endsWith(".jsx")) return "javascript";
-  if (filePath.endsWith(".ts") || filePath.endsWith(".tsx")) return "typescript";
-  return null;
 }
 
 /**
  * Find AST node at specific line range
  */
-function findNodeAtLine(
+export function findNodeAtLine(
   node: Parser.SyntaxNode,
   startLine: number,
   endLine: number

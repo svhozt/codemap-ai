@@ -3,15 +3,15 @@
  * Core implementation for CodeMap Flow Edition
  */
 
-import { readFileSync, statSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { createHash } from "crypto";
 import { glob } from "glob";
-import { resolve, relative, dirname, basename, extname } from "path";
+import { resolve, relative, extname, isAbsolute } from "path";
 import { FlowStorage } from "./storage.js";
-import { EnhancedResolver } from "./enhanced-resolver.js";
+import { CallResolver } from "./resolver.js";
 import { parserRegistry } from "../parsers/index.js";
-import type { FileAnalysis, GraphNode, GraphEdge } from "../types.js";
-import { analyzeDataFlow, getPhase3Stats } from "./builder-phase3.js";
+import { MAX_FILE_SIZE, SUPPORTED_EXTENSIONS } from "../types.js";
+import type { GraphNode } from "../types.js";
 import { analyzeFileForPhase3 } from "./phase3-analyzer.js";
 
 export interface FlowConfig {
@@ -19,6 +19,13 @@ export interface FlowConfig {
   include: string[];
   exclude: string[];
   forceReindex: boolean;
+  /**
+   * Restrict the run to these files (absolute, or relative to `rootPath`).
+   * Only files that also match `include`/`exclude` are indexed; files in the
+   * list that no longer exist are removed from the index. Other indexed files
+   * are left untouched. Used for incremental updates.
+   */
+  files?: string[];
 }
 
 export interface FlowProgress {
@@ -30,16 +37,38 @@ export interface FlowProgress {
 
 export type ProgressCallback = (progress: FlowProgress) => void;
 
-interface ModuleExports {
-  [symbolName: string]: string; // symbol name → node ID
+export interface FlowBuildResult {
+  /** Files parsed in this run. */
+  indexed: number;
+  /** Files left alone because their content hash was unchanged. */
+  skipped: number;
+  /** Resolved call edges in the whole index. */
+  resolved: number;
+  /** Unresolved call edges in the whole index (external libraries, dynamic calls). */
+  unresolved: number;
+  /** One message per file that could not be read or parsed. */
+  errors: string[];
+  /** Files dropped from the index because they were deleted or are no longer matched. */
+  removed: number;
+  /** Files skipped because they are larger than the size limit (paths relative to the root). */
+  tooLarge: string[];
+  /** True when an index from an older codemap-ai version was discarded and rebuilt. */
+  rebuilt: boolean;
+}
+
+const SUPPORTED = new Set<string>(SUPPORTED_EXTENSIONS);
+
+/** Forward slashes everywhere, so ids are the same on every platform. */
+function toPosix(path: string): string {
+  return path.replace(/\\/g, "/");
 }
 
 export class FlowBuilder {
   private storage: FlowStorage;
   private config: FlowConfig;
   private onProgress?: ProgressCallback;
-  private moduleMap = new Map<string, ModuleExports>(); // file path → exports
   private errors: string[] = [];
+  private tooLarge: string[] = [];
 
   constructor(storage: FlowStorage, config: FlowConfig) {
     this.storage = storage;
@@ -50,41 +79,71 @@ export class FlowBuilder {
     this.onProgress = callback;
   }
 
-  async build(): Promise<{
-    indexed: number;
-    skipped: number;
-    resolved: number;
-    unresolved: number;
-    errors: string[];
-  }> {
-    const rootPath = resolve(this.config.rootPath);
+  async build(): Promise<FlowBuildResult> {
+    const rootPath = toPosix(resolve(this.config.rootPath));
+    this.errors = [];
+    this.tooLarge = [];
+
+    // An index written by an older, incompatible version is rebuilt from scratch.
+    let restrictTo = this.config.files;
+    let force = this.config.forceReindex;
+    const rebuilt = this.storage.isIndexOutdated();
+    if (rebuilt) {
+      this.storage.clear();
+      restrictTo = undefined;
+      force = true;
+    }
 
     // Phase 1: Discover files
-    this.emitProgress({
-      phase: "discovering",
-      total: 0,
-      current: 0,
-      currentFile: "",
-    });
+    this.emitProgress({ phase: "discovering", total: 0, current: 0, currentFile: "" });
 
-    const allFiles = await this.discoverFiles(rootPath);
-    const filesToIndex: Array<{ path: string; hash: string }> = [];
-    let skipped = 0;
+    const discovered = await this.discoverFiles(rootPath);
+    let candidates = discovered;
+    let removed = 0;
 
-    // Check which files need indexing
-    for (const filePath of allFiles) {
-      const content = readFileSync(filePath, "utf-8");
-      const hash = this.hashContent(content);
-
-      if (!this.config.forceReindex) {
-        const existingHash = this.storage.getFileHash(filePath);
-        if (existingHash === hash) {
-          skipped++;
-          continue;
+    if (restrictTo) {
+      // Incremental run: only the listed files are considered.
+      const wanted = new Set(
+        restrictTo.map((f) => toPosix(isAbsolute(f) ? f : resolve(rootPath, f)))
+      );
+      candidates = discovered.filter((f) => wanted.has(f));
+      for (const file of wanted) {
+        if (!existsSync(file) && this.storage.getFileHash(file) !== null) {
+          this.storage.deleteFileData(file);
+          removed++;
         }
       }
+    } else {
+      // Full run: forget files that are gone or no longer matched by the patterns.
+      const current = new Set(discovered);
+      for (const file of this.storage.getIndexedFiles()) {
+        if (!current.has(file)) {
+          this.storage.deleteFileData(file);
+          removed++;
+        }
+      }
+    }
 
-      filesToIndex.push({ path: filePath, hash });
+    // Check which files need indexing
+    const filesToIndex: Array<{ path: string; hash: string; content: string }> = [];
+    let skipped = 0;
+
+    for (const filePath of candidates) {
+      let content: string;
+      try {
+        content = readFileSync(filePath, "utf-8");
+      } catch (error) {
+        this.errors.push(`${relative(rootPath, filePath)}: ${errorMessage(error)}`);
+        continue;
+      }
+      const hash = this.hashContent(content);
+
+      if (!force && this.storage.getFileHash(filePath) === hash) {
+        skipped++;
+        continue;
+      }
+
+      filesToIndex.push({ path: filePath, hash, content });
     }
 
     // Phase 2: Parse files and extract symbols
@@ -98,14 +157,14 @@ export class FlowBuilder {
       });
 
       try {
-        await this.parseAndStore(file.path, file.hash, rootPath);
+        this.storage.transaction(() => this.parseAndStore(file.path, file.hash, file.content));
         indexed++;
       } catch (error) {
-        this.errors.push(`${relative(rootPath, file.path)}: ${error}`);
+        this.errors.push(`${relative(rootPath, file.path)}: ${errorMessage(error)}`);
       }
     }
 
-    // Phase 3: Resolve cross-file calls
+    // Phase 3: Resolve references across files
     this.emitProgress({
       phase: "resolving",
       total: filesToIndex.length,
@@ -113,17 +172,10 @@ export class FlowBuilder {
       currentFile: "",
     });
 
-    // First pass: Basic resolution (existing logic)
-    this.resolveAllCalls();
-
-    // Second pass: Enhanced resolution with type tracking
-    const enhancedResolver = new EnhancedResolver(this.storage);
-    enhancedResolver.buildHierarchy();
-    const enhancedResolved = enhancedResolver.resolveAllCalls();
-
-    // Log improvement
-    if (enhancedResolved.length > 0) {
-      console.log(`✨ Enhanced resolver: resolved ${enhancedResolved.length} additional calls`);
+    new CallResolver(this.storage, rootPath).resolveAll();
+    this.storage.markIndexFormatCurrent();
+    if (!restrictTo) {
+      this.storage.setIndexPatterns(this.config.include, this.config.exclude);
     }
 
     const stats = this.storage.getStats();
@@ -141,6 +193,9 @@ export class FlowBuilder {
       resolved: stats.resolvedCalls,
       unresolved: stats.unresolvedCalls,
       errors: this.errors,
+      removed,
+      tooLarge: this.tooLarge,
+      rebuilt,
     };
   }
 
@@ -154,18 +209,20 @@ export class FlowBuilder {
         ignore: this.config.exclude,
         nodir: true,
       });
-      allFiles.push(...matches);
+      allFiles.push(...matches.map(toPosix));
     }
 
     // Filter by supported extensions and size
-    const supportedExts = new Set([".py", ".ts", ".tsx", ".js", ".jsx"]);
     const uniqueFiles = [...new Set(allFiles)].filter((f) => {
-      const ext = extname(f);
-      if (!supportedExts.has(ext)) return false;
+      if (!SUPPORTED.has(extname(f).toLowerCase())) return false;
 
       try {
         const stats = statSync(f);
-        if (stats.size > 200000) return false; // Skip files > 200KB
+        if (!stats.isFile()) return false;
+        if (stats.size > MAX_FILE_SIZE) {
+          this.tooLarge.push(relative(rootPath, f));
+          return false;
+        }
       } catch {
         return false;
       }
@@ -179,14 +236,10 @@ export class FlowBuilder {
     return createHash("sha256").update(content).digest("hex").substring(0, 16);
   }
 
-  private async parseAndStore(filePath: string, hash: string, rootPath: string): Promise<void> {
-    const language = this.getLanguage(filePath);
-    const content = readFileSync(filePath, "utf-8");
-
-    // Get parser for this language
-    const parser = parserRegistry.getByLanguage(language);
+  private parseAndStore(filePath: string, hash: string, content: string): void {
+    const parser = parserRegistry.getForFile(filePath);
     if (!parser) {
-      throw new Error(`No parser found for language: ${language}`);
+      throw new Error(`No parser found for file type: ${extname(filePath)}`);
     }
 
     // Parse with tree-sitter
@@ -195,25 +248,46 @@ export class FlowBuilder {
     // Delete old data for this file
     this.storage.deleteFileData(filePath);
 
-    // Store nodes with hashes
-    const fileExports: ModuleExports = {};
+    const fileNode = analysis.nodes.find((n) => n.type === "file");
+    const topLevelIds = new Set(
+      analysis.edges
+        .filter((e) => e.type === "contains" && e.sourceId === fileNode?.id)
+        .map((e) => e.targetId)
+    );
+    const byName = new Map<string, GraphNode>();
 
     for (const node of analysis.nodes) {
-      // Add hash to node
       const nodeHash = this.hashContent(`${node.name}:${node.startLine}:${node.endLine}`);
-      const nodeWithHash = { ...node, hash: nodeHash };
+      this.storage.insertNode({ ...node, hash: nodeHash });
 
-      this.storage.insertNode(nodeWithHash);
-
-      // Track exports (top-level functions and classes)
-      if (node.type === "function" || node.type === "class") {
-        fileExports[node.name] = node.id;
-        this.storage.registerExport(filePath, node.name, node.id);
+      // Module-level functions, classes and namespace objects are importable by name.
+      if (
+        topLevelIds.has(node.id) &&
+        (node.type === "function" || node.type === "class" || node.type === "variable")
+      ) {
+        if (!byName.has(node.name) || node.type !== "variable") byName.set(node.name, node);
       }
     }
 
-    // Store exports in module map
-    this.moduleMap.set(filePath, fileExports);
+    for (const [name, node] of byName) {
+      this.storage.registerExport(filePath, name, node.id);
+    }
+
+    // Explicit exports: default exports, renamed exports and CommonJS members.
+    for (const exp of analysis.exports) {
+      const localName = exp.localName ?? exp.name;
+      const target =
+        byName.get(localName) ??
+        analysis.nodes.find(
+          (n) => n.name === localName && n.type === "function" && n.metadata?.memberOf === "default"
+        );
+      if (!target) continue;
+      if (exp.isDefault) {
+        this.storage.registerExport(filePath, "default", target.id);
+      } else if (exp.name !== target.name || !byName.has(exp.name)) {
+        this.storage.registerExport(filePath, exp.name, target.id);
+      }
+    }
 
     // Store edges (including unresolved refs)
     for (const edge of analysis.edges) {
@@ -223,7 +297,14 @@ export class FlowBuilder {
     // Store imports
     for (const imp of analysis.imports) {
       for (const spec of imp.specifiers) {
-        this.storage.registerImport(filePath, spec, imp.source, imp.line);
+        this.storage.registerImport(
+          filePath,
+          spec,
+          imp.source,
+          imp.line,
+          imp.aliases?.[spec] ?? null,
+          imp.isReExport === true
+        );
       }
     }
 
@@ -240,7 +321,7 @@ export class FlowBuilder {
       }
     }
 
-    // Phase 3: Analyze data flow for functions and methods
+    // Data flow: property accesses and return shapes of functions and methods
     const functionNodes = analysis.nodes
       .filter((n) => n.type === "function" || n.type === "method")
       .map((n) => ({
@@ -251,14 +332,16 @@ export class FlowBuilder {
       }));
 
     if (functionNodes.length > 0) {
-      analyzeFileForPhase3(filePath, functionNodes, this.storage.db);
+      const tree = parser.getLastTree?.(filePath) ?? null;
+      analyzeFileForPhase3(filePath, functionNodes, this.storage.db, tree);
     }
 
     // Store database operations
     if (analysis.databaseOperations) {
+      let seq = 0;
       for (const dbOp of analysis.databaseOperations) {
         this.storage.insertDatabaseOperation({
-          id: `${dbOp.nodeId}:db:${dbOp.line}`,
+          id: `${dbOp.nodeId}:db:${dbOp.line}:${seq++}`,
           node_id: dbOp.nodeId,
           database_type: dbOp.databaseType,
           operation: dbOp.operation,
@@ -269,7 +352,7 @@ export class FlowBuilder {
     }
 
     // Store file record
-    this.storage.upsertFile(filePath, language, hash);
+    this.storage.upsertFile(filePath, analysis.language, hash);
 
     // Process framework-specific patterns
     this.processFrameworkPatterns(analysis.nodes, filePath);
@@ -284,13 +367,13 @@ export class FlowBuilder {
         // 1. Process FastAPI HTTP endpoints
         const httpEndpoint = node.metadata.httpEndpoint as { method: string; path: string } | undefined;
         if (httpEndpoint) {
-          const endpointId = `${httpEndpoint.method}:${httpEndpoint.path}`;
           this.storage.insertHttpEndpoint({
-            id: endpointId,
+            // The handler is part of the id: two routers may serve the same path.
+            id: `${httpEndpoint.method}:${httpEndpoint.path}:${node.id}`,
             method: httpEndpoint.method,
             path: httpEndpoint.path,
             handler_node_id: node.id,
-            container_id: undefined, // Will be set when docker-compose is parsed
+            container_id: undefined,
             metadata: {
               filePath,
               functionName: node.name,
@@ -312,7 +395,7 @@ export class FlowBuilder {
             this.storage.insertFrameworkDependency({
               id: depId,
               source_node_id: node.id,
-              target_node_id: undefined, // Will be resolved later
+              target_node_id: undefined, // Resolved after all files are parsed
               framework: "fastapi",
               pattern: "depends",
               parameter_name: dep.parameterName,
@@ -329,142 +412,13 @@ export class FlowBuilder {
     }
   }
 
-  private resolveAllCalls(): void {
-    // Get all unresolved edges (target_id starts with "ref:")
-    const unresolvedEdges = this.storage.db
-      .prepare(`SELECT * FROM edges WHERE target_id LIKE 'ref:%'`)
-      .all() as Array<{
-        id: string;
-        source_id: string;
-        target_id: string;
-        type: string;
-        metadata: string | null;
-      }>;
-
-    for (const edge of unresolvedEdges) {
-      const refName = edge.target_id.replace("ref:", "");
-      const sourceNode = this.storage.getNode(edge.source_id);
-
-      if (!sourceNode) continue;
-
-      // Try to resolve the reference (pass source node ID for scope resolution)
-      const resolvedId = this.resolveReference(sourceNode.filePath, refName, edge.source_id);
-
-      if (resolvedId) {
-        // Update edge with resolved target
-        this.storage.insertEdge({
-          id: edge.id,
-          type: edge.type as GraphEdge["type"],
-          sourceId: edge.source_id,
-          targetId: resolvedId,
-          metadata: edge.metadata ? JSON.parse(edge.metadata) : undefined,
-        });
-      }
-    }
-
-    // Also resolve framework dependencies (FastAPI Depends)
-    this.resolveFrameworkDependencies();
-  }
-
-  /**
-   * Resolve framework dependencies (e.g., FastAPI Depends())
-   */
-  private resolveFrameworkDependencies(): void {
-    const unresolvedDeps = this.storage.getAllUnresolvedDependencies();
-
-    for (const dep of unresolvedDeps) {
-      const sourceNode = this.storage.getNode(dep.source_node_id);
-      if (!sourceNode) continue;
-
-      // Try to resolve the dependency name to an actual node
-      const resolvedId = this.resolveReference(sourceNode.filePath, dep.unresolved_name);
-
-      if (resolvedId) {
-        // Update the dependency with resolved target
-        this.storage.updateFrameworkDependencyTarget(dep.id, resolvedId);
-
-        // Also create an edge for the call graph
-        this.storage.insertEdge({
-          id: `${dep.id}:edge`,
-          type: "calls",
-          sourceId: dep.source_node_id,
-          targetId: resolvedId,
-          metadata: {
-            framework: "fastapi",
-            pattern: "depends",
-            line: dep.line,
-          },
-        });
-      }
-    }
-  }
-
-  private resolveReference(sourceFilePath: string, refName: string, scopeNodeId?: string): string | null {
-    // Strategy 0a: Handle super() calls
-    if (refName.startsWith("super().") && scopeNodeId) {
-      const methodName = refName.replace("super().", "");
-      const resolvedSuper = this.storage.resolveSuperMethod(methodName, scopeNodeId);
-      if (resolvedSuper) {
-        return resolvedSuper;
-      }
-    }
-
-    // Strategy 0b: Handle attribute calls (variable.method or ClassName.method)
-    if (refName.includes(".")) {
-      const parts = refName.split(".");
-      if (parts.length === 2) {
-        const [objectName, methodName] = parts;
-
-        // Try variable.method resolution first (if we have scope)
-        if (scopeNodeId) {
-          const resolvedVarMethod = this.storage.resolveVariableMethod(objectName, methodName, scopeNodeId);
-          if (resolvedVarMethod) {
-            return resolvedVarMethod;
-          }
-        }
-
-        // Fall back to ClassName.method resolution
-        const resolvedClassMethod = this.storage.resolveClassMethod(objectName, methodName, sourceFilePath);
-        if (resolvedClassMethod) {
-          return resolvedClassMethod;
-        }
-      }
-    }
-
-    // Strategy 1: Look in the same file
-    const nodesInFile = this.storage.getNodesByFile(sourceFilePath);
-    for (const node of nodesInFile) {
-      if (node.name === refName) {
-        return node.id;
-      }
-    }
-
-    // Strategy 2: Check imports
-    const resolvedFromImport = this.storage.resolveImport(sourceFilePath, refName);
-    if (resolvedFromImport) {
-      return resolvedFromImport;
-    }
-
-    // Strategy 3: Search all nodes (fallback)
-    const matches = this.storage.searchNodesByName(refName);
-    if (matches.length === 1) {
-      return matches[0].id;
-    }
-
-    return null;
-  }
-
-  private getLanguage(filePath: string): string {
-    const ext = extname(filePath);
-    if (ext === ".py") return "python";
-    if (ext === ".ts" || ext === ".tsx") return "typescript";
-    if (ext === ".js" || ext === ".jsx") return "javascript";
-    return "unknown";
-  }
-
   private emitProgress(progress: FlowProgress): void {
     if (this.onProgress) {
       this.onProgress(progress);
     }
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
