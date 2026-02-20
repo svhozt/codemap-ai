@@ -1,10 +1,22 @@
 /**
  * Import dependency analyzer
- * Detects missing/unused imports and tracks what they're used for
- * Uses regex-based parsing for fast analysis
+ *
+ * Works on syntax trees, so multi-line imports, type-only usages, JSX and
+ * comments/strings are all handled correctly.
+ *
+ *   unused  - a name bound by an import that is never referenced in the file
+ *   missing - a name that was imported in the previous version of the file,
+ *             is no longer imported or declared, but is still referenced
+ *
+ * "Missing" is deliberately defined relative to the previous version: it
+ * catches the real failure (an import was deleted while its uses remain)
+ * without guessing which bare identifiers are globals.
  */
 
 import { readFileSync } from "fs";
+import type Parser from "tree-sitter";
+import { parserRegistry } from "../parsers/index.js";
+import type { ImportInfo } from "../types.js";
 
 export interface ImportIssue {
   identifier: string;
@@ -18,349 +30,249 @@ export interface ImportAnalysisResult {
   unused: ImportIssue[];
 }
 
-/**
- * Check if identifier is a JavaScript/TypeScript builtin
- */
-function isJavaScriptBuiltin(identifier: string): boolean {
-  // Common JavaScript globals and keywords
-  const builtins = new Set([
-    "Object", "Array", "String", "Number", "Boolean", "Date", "RegExp",
-    "Error", "TypeError", "SyntaxError", "ReferenceError",
-    "Promise", "Map", "Set", "WeakMap", "WeakSet",
-    "JSON", "Math", "Infinity", "NaN", "undefined",
-    "Function", "Symbol", "Proxy", "Reflect",
-    "Int8Array", "Uint8Array", "Int16Array", "Uint16Array",
-    "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
-    "BigInt", "ArrayBuffer", "DataView",
-    "Intl", "WebAssembly", "Buffer", "URL", "URLSearchParams",
-    "console", "process", "global", "window", "document",
-    // Common keywords that look like types
-    "TRUE", "FALSE", "NULL",
-  ]);
+export interface ImportAnalysisOptions {
+  /** Current content of the file. Read from disk when omitted. */
+  content?: string;
+  /** Content of the previous version, used to detect removed-but-still-used imports. */
+  previousContent?: string | null;
+}
 
-  return builtins.has(identifier);
+type SyntaxNode = Parser.SyntaxNode;
+
+const PY_IMPORT_STATEMENTS = new Set([
+  "import_statement",
+  "import_from_statement",
+  "future_import_statement",
+]);
+
+/** Names an import binds in the importing file, with the line of the import. */
+function boundNames(imports: ImportInfo[], isPython: boolean): Map<string, number> {
+  const names = new Map<string, number>();
+  for (const imp of imports) {
+    if (imp.isReExport) continue;
+    for (const spec of imp.specifiers) {
+      if (spec === "*") continue;
+      // Python `import a.b.c` binds only `a`.
+      const local = isPython && spec.includes(".") ? spec.split(".")[0] : spec;
+      if (!names.has(local)) names.set(local, imp.line);
+    }
+  }
+  return names;
+}
+
+function isRequireDeclaration(node: SyntaxNode): boolean {
+  if (node.type !== "lexical_declaration" && node.type !== "variable_declaration") return false;
+  return node.namedChildren.some((declarator) => {
+    let value = declarator.childForFieldName("value");
+    if (value?.type === "member_expression") value = value.childForFieldName("object");
+    if (value?.type !== "call_expression") return false;
+    const fn = value.childForFieldName("function");
+    return fn?.type === "identifier" && fn.text === "require";
+  });
+}
+
+interface Usage {
+  /** identifier -> lines where it is referenced outside import statements */
+  references: Map<string, number[]>;
+  /** identifiers declared by the file itself (functions, classes, variables, parameters...) */
+  declared: Set<string>;
+  hasJsx: boolean;
+  /** Python `__all__` entries: re-exported names count as used. */
+  exportedNames: Set<string>;
+}
+
+function collectUsage(root: SyntaxNode, isPython: boolean): Usage {
+  const references = new Map<string, number[]>();
+  const declared = new Set<string>();
+  const exportedNames = new Set<string>();
+  let hasJsx = false;
+
+  const declare = (node: SyntaxNode | null): void => {
+    if (!node) return;
+    if (
+      node.type === "identifier" ||
+      node.type === "type_identifier" ||
+      node.type === "shorthand_property_identifier_pattern"
+    ) {
+      declared.add(node.text);
+      return;
+    }
+    // Destructuring patterns, tuples, typed parameters...
+    for (const child of node.namedChildren) {
+      if (child.type === "type_annotation" || child.type === "type") continue;
+      declare(child);
+    }
+  };
+
+  const walk = (node: SyntaxNode): void => {
+    const type = node.type;
+
+    if (isPython) {
+      if (PY_IMPORT_STATEMENTS.has(type)) return;
+      if (type === "function_definition" || type === "class_definition") {
+        declare(node.childForFieldName("name"));
+      } else if (type === "parameters" || type === "lambda_parameters") {
+        declare(node);
+      } else if (type === "assignment" || type === "augmented_assignment") {
+        const left = node.childForFieldName("left");
+        if (left && left.type !== "attribute" && left.type !== "subscript") declare(left);
+        if (left?.text === "__all__") {
+          for (const str of node.descendantsOfType("string_content")) exportedNames.add(str.text);
+        }
+      } else if (type === "for_statement" || type === "for_in_clause") {
+        declare(node.childForFieldName("left"));
+      } else if (type === "as_pattern") {
+        declare(node.childForFieldName("alias"));
+      } else if (type === "named_expression") {
+        declare(node.childForFieldName("name"));
+      } else if (type === "string" && hasAncestor(node, "type")) {
+        // Forward references: def f(user: "User") / x: "Optional[User]"
+        const line = node.startPosition.row + 1;
+        for (const match of node.text.matchAll(/[A-Za-z_]\w*/g)) {
+          const lines = references.get(match[0]);
+          if (lines) lines.push(line);
+          else references.set(match[0], [line]);
+        }
+        return;
+      }
+    } else {
+      if (type === "import_statement" || isRequireDeclaration(node)) return;
+      if (type.startsWith("jsx_")) hasJsx = true;
+      if (
+        type === "function_declaration" ||
+        type === "generator_function_declaration" ||
+        type === "class_declaration" ||
+        type === "abstract_class_declaration" ||
+        type === "interface_declaration" ||
+        type === "type_alias_declaration" ||
+        type === "enum_declaration" ||
+        type === "function_expression" ||
+        type === "class"
+      ) {
+        declare(node.childForFieldName("name"));
+      } else if (type === "variable_declarator") {
+        declare(node.childForFieldName("name"));
+      } else if (type === "formal_parameters") {
+        for (const param of node.namedChildren) {
+          declare(param.childForFieldName("pattern") ?? param);
+        }
+      } else if (type === "arrow_function") {
+        const single = node.childForFieldName("parameter");
+        if (single) declare(single);
+      } else if (type === "catch_clause") {
+        declare(node.childForFieldName("parameter"));
+      } else if (type === "type_parameter") {
+        declare(node.childForFieldName("name") ?? node.namedChildren[0]);
+      }
+    }
+
+    if (
+      type === "identifier" ||
+      type === "type_identifier" ||
+      type === "shorthand_property_identifier"
+    ) {
+      if (!isPropertyName(node, isPython)) {
+        const lines = references.get(node.text);
+        const line = node.startPosition.row + 1;
+        if (lines) {
+          if (lines[lines.length - 1] !== line) lines.push(line);
+        } else {
+          references.set(node.text, [line]);
+        }
+      }
+      return;
+    }
+
+    for (const child of node.namedChildren) walk(child);
+  };
+
+  walk(root);
+  return { references, declared, hasJsx, exportedNames };
+}
+
+function hasAncestor(node: SyntaxNode, type: string): boolean {
+  for (let current = node.parent; current; current = current.parent) {
+    if (current.type === type) return true;
+    if (current.type === "function_definition" || current.type === "block") return false;
+  }
+  return false;
+}
+
+/** True for identifiers that name a member or keyword rather than reference a binding. */
+function isPropertyName(node: SyntaxNode, isPython: boolean): boolean {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (isPython) {
+    if (parent.type === "attribute") {
+      return parent.childForFieldName("attribute")?.id === node.id;
+    }
+    if (parent.type === "keyword_argument") {
+      return parent.childForFieldName("name")?.id === node.id;
+    }
+  }
+  return false;
 }
 
 /**
- * Check if identifier is a Python builtin
+ * Analyze the imports of one file.
+ *
+ * With `previousContent`, imports that were removed while the imported name is
+ * still used are reported as `missing`.
  */
-function isPythonBuiltin(identifier: string): boolean {
-  const builtins = new Set([
-    "True", "False", "None",
-    "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
-    "AttributeError", "IndexError", "RuntimeError", "NotImplementedError",
-    "Dict", "List", "Tuple", "Set", "FrozenSet",
-    "Optional", "Union", "Any", "Callable",
-  ]);
+export function analyzeImports(
+  filePath: string,
+  options: ImportAnalysisOptions = {}
+): ImportAnalysisResult {
+  const result: ImportAnalysisResult = { missing: [], unused: [] };
 
-  return builtins.has(identifier);
-}
+  const parser = parserRegistry.getForFile(filePath);
+  if (!parser) return result;
 
-/**
- * Analyze import integrity in a JavaScript/TypeScript file
- */
-export function analyzeJavaScriptImports(filePath: string): ImportAnalysisResult {
-  const content = readFileSync(filePath, "utf-8");
-  const lines = content.split("\n");
-
-  // Extract imports using regex
-  const imports = new Map<string, number>(); // identifier -> line number
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Match: import X from 'Y'
-    const defaultMatch = line.match(/import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/);
-    if (defaultMatch) {
-      imports.set(defaultMatch[1], i + 1);
-    }
-
-    // Match: import { X, Y } from 'Z'
-    const namedMatch = line.match(/import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/);
-    if (namedMatch) {
-      const names = namedMatch[1].split(",").map(n => n.trim().split(" as ")[0].trim());
-      names.forEach(name => imports.set(name, i + 1));
+  let content = options.content;
+  if (content === undefined) {
+    try {
+      content = readFileSync(filePath, "utf-8");
+    } catch {
+      return result; // deleted or unreadable: nothing to analyze
     }
   }
 
-  // Extract used identifiers (simplified - exclude comments/strings)
-  const usedIdentifiers = new Map<string, number[]>(); // identifier -> line numbers
+  const isPython = parser.language === "python";
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  // Parse the previous version first: the parser keeps the tree of its last parse.
+  let previousNames: Map<string, number> | null = null;
+  if (typeof options.previousContent === "string") {
+    previousNames = boundNames(parser.parse(filePath, options.previousContent).imports, isPython);
+  }
 
-    // Skip import lines and comments
-    if (line.trim().startsWith("import ") || line.trim().startsWith("//") || line.trim().startsWith("*")) {
-      continue;
-    }
+  const analysis = parser.parse(filePath, content);
+  const tree = parser.getLastTree?.(filePath);
+  if (!tree) return result;
 
-    // Find all identifiers in this line
-    for (const [identifier] of imports) {
-      // Simple regex to find identifier usage (not perfect but good enough)
-      const regex = new RegExp(`\\b${identifier}\\b`, "g");
-      if (regex.test(line)) {
-        if (!usedIdentifiers.has(identifier)) {
-          usedIdentifiers.set(identifier, []);
-        }
-        usedIdentifiers.get(identifier)!.push(i + 1);
-      }
+  const currentNames = boundNames(analysis.imports, isPython);
+  const usage = collectUsage(tree.rootNode, isPython);
+
+  // Unused imports. Package __init__ files import in order to re-export.
+  const isPackageInit = /(^|[\\/])__init__\.py$/.test(filePath);
+  if (!isPackageInit) {
+    for (const [identifier, line] of currentNames) {
+      if (usage.references.has(identifier)) continue;
+      if (usage.exportedNames.has(identifier)) continue;
+      if (identifier === "React" && usage.hasJsx) continue; // classic JSX runtime
+      if (identifier === "_") continue;
+      result.unused.push({ identifier, line, type: "unused" });
     }
   }
 
-  // Find unused imports
-  const unused: ImportIssue[] = [];
-  for (const [identifier, line] of imports) {
-    const usage = usedIdentifiers.get(identifier);
-    if (!usage || usage.length === 0) {
-      unused.push({ identifier, line, type: "unused" });
+  // Imports that were removed while the name is still in use.
+  if (previousNames) {
+    for (const identifier of previousNames.keys()) {
+      if (currentNames.has(identifier) || usage.declared.has(identifier)) continue;
+      const usedAt = usage.references.get(identifier);
+      if (!usedAt || usedAt.length === 0) continue;
+      result.missing.push({ identifier, line: usedAt[0], type: "missing", usedAt });
     }
   }
 
-  // Find missing imports (UNIVERSAL - detect ANY identifier used but not imported)
-  const missing: ImportIssue[] = [];
-
-  // First, extract locally-defined identifiers (classes, functions, const)
-  const localDefinitions = new Set<string>();
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Match: class ClassName
-    const classMatch = line.match(/^(?:export\s+)?class\s+([A-Z][a-zA-Z0-9]*)/);
-    if (classMatch) {
-      localDefinitions.add(classMatch[1]);
-    }
-
-    // Match: function functionName
-    const funcMatch = line.match(/^(?:export\s+)?(?:async\s+)?function\s+([A-Z][a-zA-Z0-9]*)/);
-    if (funcMatch) {
-      localDefinitions.add(funcMatch[1]);
-    }
-
-    // Match: const ConstantName =
-    const constMatch = line.match(/^(?:export\s+)?const\s+([A-Z][a-z][a-zA-Z0-9]*)\s*=/);
-    if (constMatch) {
-      localDefinitions.add(constMatch[1]);
-    }
-  }
-
-  // Extract all capitalized identifiers that look like they should be imported
-  // Patterns: CapitalizedWords, UPPERCASE_CONSTANTS
-  const potentialImports = new Set<string>();
-
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    // Skip import lines, comments
-    if (line.trim().startsWith("import ") ||
-        line.trim().startsWith("//") ||
-        line.trim().startsWith("*") ||
-        line.trim().startsWith("#")) {
-      continue;
-    }
-
-    // Remove inline comments (// and /* */)
-    line = line.replace(/\/\/.*$/g, "");
-    line = line.replace(/\/\*.*?\*\//g, "");
-
-    // Remove strings and template literals to avoid false positives
-    line = line.replace(/[`"'].*?[`"']/g, "");
-
-    // Match identifiers that look like imported types/classes
-    // Pattern: PascalCase or mixedCase (not SCREAMING_SNAKE_CASE)
-    // Examples: CallToolRequestSchema, Redis, MongoClient (YES)
-    // Skip: LOG_LEVEL, ECONNREFUSED, MAX_VALUE (NO - these are constants)
-    // Skip: obj.Property (property access chains)
-    const matches = line.matchAll(/(?<!\.)([A-Z][a-z][a-zA-Z0-9]*)(?!\.)/g);
-    for (const match of matches) {
-      const identifier = match[1];
-
-      // Skip common JavaScript globals and keywords
-      if (!isJavaScriptBuiltin(identifier)) {
-        potentialImports.add(identifier);
-      }
-    }
-  }
-
-  // Check which potential imports are actually missing
-  for (const identifier of potentialImports) {
-    // Skip if it's imported OR defined locally
-    if (!imports.has(identifier) && !localDefinitions.has(identifier)) {
-      // Find where it's used
-      const usageLines: number[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        // Match whole word only (not part of another identifier)
-        const regex = new RegExp(`\\b${identifier}\\b`);
-        if (regex.test(line) && !line.trim().startsWith("//")) {
-          usageLines.push(i + 1);
-        }
-      }
-
-      if (usageLines.length > 0) {
-        missing.push({
-          identifier,
-          line: usageLines[0],
-          type: "missing",
-          usedAt: usageLines,
-        });
-      }
-    }
-  }
-
-  return { missing, unused };
-}
-
-/**
- * Analyze import integrity in a Python file
- */
-export function analyzePythonImports(filePath: string): ImportAnalysisResult {
-  const content = readFileSync(filePath, "utf-8");
-  const lines = content.split("\n");
-
-  // Extract imports
-  const imports = new Map<string, number>(); // identifier -> line number
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Match: import X
-    const importMatch = line.match(/^import\s+(\w+)/);
-    if (importMatch) {
-      imports.set(importMatch[1], i + 1);
-    }
-
-    // Match: from X import Y
-    const fromMatch = line.match(/^from\s+[\w.]+\s+import\s+(.+)/);
-    if (fromMatch) {
-      const names = fromMatch[1].split(",").map(n => n.trim().split(" as ")[0].trim());
-      names.forEach(name => imports.set(name, i + 1));
-    }
-  }
-
-  // Extract used identifiers
-  const usedIdentifiers = new Map<string, number[]>();
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Skip import lines and comments
-    if (line.trim().startsWith("import ") || line.trim().startsWith("from ") || line.trim().startsWith("#")) {
-      continue;
-    }
-
-    // Find all identifiers in this line
-    for (const [identifier] of imports) {
-      const regex = new RegExp(`\\b${identifier}\\b`, "g");
-      if (regex.test(line)) {
-        if (!usedIdentifiers.has(identifier)) {
-          usedIdentifiers.set(identifier, []);
-        }
-        usedIdentifiers.get(identifier)!.push(i + 1);
-      }
-    }
-  }
-
-  // Find unused imports
-  const unused: ImportIssue[] = [];
-  for (const [identifier, line] of imports) {
-    const usage = usedIdentifiers.get(identifier);
-    if (!usage || usage.length === 0) {
-      unused.push({ identifier, line, type: "unused" });
-    }
-  }
-
-  // Find missing imports (UNIVERSAL - detect ANY identifier used but not imported)
-  const missing: ImportIssue[] = [];
-
-  // First, extract locally-defined identifiers (classes, functions)
-  const localDefinitions = new Set<string>();
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Match: class ClassName
-    const classMatch = line.match(/^class\s+([A-Z][a-zA-Z0-9_]*)/);
-    if (classMatch) {
-      localDefinitions.add(classMatch[1]);
-    }
-
-    // Match: def FunctionName
-    const funcMatch = line.match(/^(?:async\s+)?def\s+([A-Z][a-zA-Z0-9_]*)/);
-    if (funcMatch) {
-      localDefinitions.add(funcMatch[1]);
-    }
-  }
-
-  // Extract all capitalized identifiers (likely classes/types)
-  const potentialImports = new Set<string>();
-
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    // Skip import lines and comments
-    if (line.trim().startsWith("import ") ||
-        line.trim().startsWith("from ") ||
-        line.trim().startsWith("#")) {
-      continue;
-    }
-
-    // Remove inline comments
-    line = line.replace(/#.*$/g, "");
-
-    // Remove strings to avoid false positives
-    line = line.replace(/[`"'f].*?[`"']/g, "");
-
-    // Match capitalized identifiers (likely imported classes/types)
-    // Skip property access chains
-    const matches = line.matchAll(/(?<!\.)([A-Z][a-zA-Z0-9_]*)(?!\.)/g);
-    for (const match of matches) {
-      const identifier = match[1];
-
-      // Skip Python builtins
-      if (!isPythonBuiltin(identifier)) {
-        potentialImports.add(identifier);
-      }
-    }
-  }
-
-  // Check which potential imports are actually missing
-  for (const identifier of potentialImports) {
-    // Skip if it's imported OR defined locally
-    if (!imports.has(identifier) && !localDefinitions.has(identifier)) {
-      // Find where it's used
-      const usageLines: number[] = [];
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const regex = new RegExp(`\\b${identifier}\\b`);
-        if (regex.test(line) && !line.trim().startsWith("#")) {
-          usageLines.push(i + 1);
-        }
-      }
-
-      if (usageLines.length > 0) {
-        missing.push({
-          identifier,
-          line: usageLines[0],
-          type: "missing",
-          usedAt: usageLines,
-        });
-      }
-    }
-  }
-
-  return { missing, unused };
-}
-
-/**
- * Main entry point - analyzes imports based on file type
- */
-export function analyzeImports(filePath: string): ImportAnalysisResult {
-  if (filePath.endsWith(".py")) {
-    return analyzePythonImports(filePath);
-  } else if (filePath.match(/\.(js|jsx|ts|tsx)$/)) {
-    return analyzeJavaScriptImports(filePath);
-  }
-
-  return { missing: [], unused: [] };
+  return result;
 }
