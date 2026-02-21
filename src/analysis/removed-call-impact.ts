@@ -4,7 +4,20 @@
  */
 
 import type { FlowStorage } from '../flow/storage.js';
-import type { RemovedCall } from './removed-calls.js';
+
+export interface RemovedCall {
+  callee: string;        // Function that was called (last segment of the expression)
+  removedFrom: string;   // Function it was removed from
+  file: string;
+  lineNumber: number;    // Line in the previous version of the file
+  rawContent: string;    // Original line content
+  /** Callee as written in the source, e.g. `self.repo.validate`. */
+  expression?: string;
+  /** Node id of the callee in the index, when it could be resolved. */
+  calleeId?: string | null;
+  /** Node id of the function the call was removed from. */
+  removedFromId?: string | null;
+}
 
 export interface RemovedCallImpact {
   removedCall: RemovedCall;
@@ -26,6 +39,7 @@ export interface RemovedCallImpact {
 
   // Propagated impact: all functions that depend on removedFrom
   impactedFunctions: Array<{
+    id: string;
     name: string;
     file: string;
     line: number;
@@ -61,6 +75,45 @@ const SECURITY_KEYWORDS = [
 ];
 
 /**
+ * Narrower list for calls to code outside the index (libraries, closures):
+ * without call-graph evidence only unmistakable access-control and validation
+ * names are worth a warning (not `filter`, `query`, `hash`...).
+ */
+const ACCESS_CHECK_WORDS = [
+  'auth', 'authenticate', 'authorize', 'authorization', 'permission', 'permissions',
+  'verify', 'validate', 'validation', 'sanitize', 'csrf', 'xsrf', 'jwt', 'admin',
+  'login', 'captcha', 'ratelimit', 'throttle', 'acl', 'rbac',
+];
+
+/** True for names like `isAdmin`, `verify_jwt`, `checkPermission`, `validateInput`. */
+export function isAccessCheckName(name: string): boolean {
+  return identifierWords(name).some((word) => ACCESS_CHECK_WORDS.includes(word));
+}
+
+/** Split an identifier into lower-case words: `validateAuthToken` / `validate_auth_token`. */
+export function identifierWords(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+}
+
+/**
+ * True when a function name looks security or validation related. Matching is
+ * done on whole words, so `author` does not match `auth`.
+ */
+export function isSecuritySensitiveName(name: string): boolean {
+  const words = identifierWords(name);
+  const joined = words.join('');
+  return SECURITY_KEYWORDS.some((keyword) => {
+    const compact = keyword.replace(/_/g, '');
+    return words.includes(compact) || (compact.length >= 6 && joined.includes(compact));
+  });
+}
+
+/**
  * Analyze the impact of removed function calls
  */
 export function analyzeRemovedCallImpact(
@@ -91,20 +144,41 @@ function analyzeSingleRemovedCall(
   removedCall: RemovedCall,
   storage: FlowStorage
 ): RemovedCallImpact | null {
-  // Step 1: Find the function node in call graph
-  const nodes = storage.searchNodesByName(removedCall.callee);
+  // Step 1: Find the function node in call graph.
+  // Callers that already resolved the callee pass its id; a name lookup is the fallback.
+  const functionNode =
+    removedCall.calleeId !== undefined
+      ? removedCall.calleeId
+        ? storage.getNode(removedCall.calleeId)
+        : null
+      : storage.findSymbols(removedCall.callee).find((n) => n.match === 'exact') ?? null;
 
-  if (nodes.length === 0) {
-    // Function not in graph (might be external library or not indexed)
-    return null;
+  if (!functionNode) {
+    // Not defined in the indexed code (library, closure, dynamic). Only a
+    // security-looking call is worth reporting without call-graph evidence.
+    if (!isAccessCheckName(removedCall.callee)) return null;
+    return {
+      removedCall,
+      stillCalledBy: [],
+      impactedFunctions: [],
+      severity: 'HIGH',
+      description:
+        `${removedCall.expression ?? removedCall.callee}() was removed from ${removedCall.removedFrom}()\n` +
+        `Security-related call removed (not defined in the indexed code, so its other callers are unknown)`,
+    };
   }
 
-  const functionNode = nodes[0];
+  const removedFromNode =
+    removedCall.removedFromId !== undefined
+      ? removedCall.removedFromId
+        ? storage.getNode(removedCall.removedFromId)
+        : null
+      : storage.findSymbols(removedCall.removedFrom).find((n) => n.match !== 'partial') ?? null;
 
   // Step 2: Check if function is still called elsewhere
   const allCallers = storage.getResolvedCallers(functionNode.id);
   const stillCalledBy = allCallers
-    .filter(c => c.name !== removedCall.removedFrom)
+    .filter(c => (removedFromNode ? c.id !== removedFromNode.id : c.name !== removedCall.removedFrom))
     .map(c => ({
       name: c.name,
       file: c.filePath,
@@ -113,28 +187,21 @@ function analyzeSingleRemovedCall(
 
   // Step 3: Find all functions that call removedFrom
   // (These are the functions that are now affected)
-  const removedFromNodes = storage.searchNodesByName(removedCall.removedFrom);
+  let impactedFunctions: RemovedCallImpact['impactedFunctions'] = [];
 
-  let impactedFunctions: Array<{
-    name: string;
-    file: string;
-    line: number;
-    reason: string;
-  }> = [];
-
-  if (removedFromNodes.length > 0) {
-    const removedFromNode = removedFromNodes[0];
-
-    // Get all functions that depend on removedFrom
+  if (removedFromNode) {
     // Use BFS with depth limit to prevent explosion
     const impactedNodes = storage.getImpactedNodes(removedFromNode.id, 5);
 
-    impactedFunctions = impactedNodes.map(n => ({
-      name: n.name,
-      file: n.filePath,
-      line: n.startLine,
-      reason: `Calls ${removedCall.removedFrom}() which no longer calls ${removedCall.callee}()`,
-    }));
+    impactedFunctions = impactedNodes
+      .filter(n => n.type !== 'file')
+      .map(n => ({
+        id: n.id,
+        name: n.name,
+        file: n.filePath,
+        line: n.startLine,
+        reason: `Calls ${removedCall.removedFrom}() which no longer calls ${removedCall.callee}()`,
+      }));
   }
 
   // Step 4: Calculate severity
@@ -176,9 +243,7 @@ function calculateSeverity(
   impactedFunctions: Array<{ name: string }>
 ): 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' {
   // Check if this is a security/validation function
-  const isSecurityFunction = SECURITY_KEYWORDS.some(keyword =>
-    removedCall.callee.toLowerCase().includes(keyword)
-  );
+  const isSecurityFunction = isSecuritySensitiveName(removedCall.callee);
 
   // CRITICAL: Security function removed and has significant impact
   if (isSecurityFunction && impactedFunctions.length > 5) {
