@@ -3,7 +3,7 @@
  * Analyzes function return statements to track data shapes and types
  */
 
-import Parser from "tree-sitter";
+import type Parser from "tree-sitter";
 
 export interface ReturnInfo {
   functionId: string;
@@ -415,25 +415,6 @@ function traverseNode(
 }
 
 /**
- * Build a map of function returns
- */
-export function buildReturnTypeMap(returns: ReturnInfo[]): Map<string, ReturnInfo[]> {
-  const map = new Map<string, ReturnInfo[]>();
-
-  for (const returnInfo of returns) {
-    const key = returnInfo.functionId;
-
-    if (!map.has(key)) {
-      map.set(key, []);
-    }
-
-    map.get(key)!.push(returnInfo);
-  }
-
-  return map;
-}
-
-/**
  * Merge multiple object shapes into one
  * (for functions with multiple return statements)
  */
@@ -479,22 +460,6 @@ export function mergeObjectShapes(shapes: ObjectShape[]): ObjectShape | null {
     isDictionary,
     isOptional: false,
   };
-}
-
-/**
- * Check if two object shapes are compatible
- */
-export function areShapesCompatible(
-  shape1: ObjectShape,
-  shape2: ObjectShape
-): boolean {
-  // Check if all properties in shape1 exist in shape2
-  for (const prop of shape1.properties) {
-    if (!shape2.properties.includes(prop)) {
-      return false;
-    }
-  }
-  return true;
 }
 
 /**

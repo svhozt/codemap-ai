@@ -3,7 +3,7 @@
  * Extracts and tracks property accesses from code to detect breaking data shape changes
  */
 
-import Parser from "tree-sitter";
+import type Parser from "tree-sitter";
 
 export interface PropertyAccess {
   objectName: string;       // "user"
@@ -14,24 +14,13 @@ export interface PropertyAccess {
   accessType: 'dot' | 'bracket' | 'optional';
 }
 
-export interface PropertyAccessMap {
-  [fullPath: string]: AccessLocation[];
-}
-
-export interface AccessLocation {
-  scopeId: string;
-  scopeName: string;
-  file: string;
-  line: number;
-}
-
 /**
  * Extract all property accesses from a function's AST node
  */
 export function extractPropertyAccesses(
   functionNode: Parser.SyntaxNode,
   scopeId: string,
-  scopeName: string,
+  _scopeName: string,
   filePath: string
 ): PropertyAccess[] {
   const accesses: PropertyAccess[] = [];
@@ -39,9 +28,9 @@ export function extractPropertyAccesses(
   const isPython = /\.py$/.test(filePath);
 
   if (isJS) {
-    extractJavaScriptPropertyAccesses(functionNode, scopeId, scopeName, accesses);
+    extractJavaScriptPropertyAccesses(functionNode, scopeId, accesses);
   } else if (isPython) {
-    extractPythonPropertyAccesses(functionNode, scopeId, scopeName, accesses);
+    extractPythonPropertyAccesses(functionNode, scopeId, accesses);
   }
 
   return accesses;
@@ -53,7 +42,6 @@ export function extractPropertyAccesses(
 function extractJavaScriptPropertyAccesses(
   node: Parser.SyntaxNode,
   scopeId: string,
-  scopeName: string,
   accesses: PropertyAccess[]
 ): void {
   traverseNode(node, (current) => {
@@ -179,7 +167,6 @@ function parseJavaScriptSubscript(
 function extractPythonPropertyAccesses(
   node: Parser.SyntaxNode,
   scopeId: string,
-  scopeName: string,
   accesses: PropertyAccess[]
 ): void {
   traverseNode(node, (current) => {
@@ -344,97 +331,4 @@ function isCommonPythonObject(name: string): boolean {
   ]);
 
   return commonObjects.has(name);
-}
-
-/**
- * Build a map of property accesses grouped by full path
- */
-export function buildAccessMap(
-  accesses: PropertyAccess[],
-  scopeName: string,
-  file: string
-): PropertyAccessMap {
-  const map: PropertyAccessMap = {};
-
-  for (const access of accesses) {
-    const key = access.fullPath;
-
-    if (!map[key]) {
-      map[key] = [];
-    }
-
-    map[key].push({
-      scopeId: access.scopeId,
-      scopeName,
-      file,
-      line: access.line,
-    });
-  }
-
-  return map;
-}
-
-/**
- * Get all accesses for a specific property path
- */
-export function getAccessesForProperty(
-  propertyPath: string,
-  allAccesses: PropertyAccess[]
-): PropertyAccess[] {
-  return allAccesses.filter((access) => access.fullPath === propertyPath);
-}
-
-/**
- * Get all accesses on a specific object
- */
-export function getAccessesForObject(
-  objectName: string,
-  allAccesses: PropertyAccess[]
-): PropertyAccess[] {
-  return allAccesses.filter((access) => access.objectName === objectName);
-}
-
-/**
- * Check if a property access matches a pattern
- * E.g., matches("user.email", "user.*") -> true
- */
-export function matchesPattern(fullPath: string, pattern: string): boolean {
-  // Convert pattern to regex
-  const regexPattern = pattern
-    .replace(/\./g, "\\.")  // Escape dots
-    .replace(/\*/g, ".*");   // Wildcard
-
-  const regex = new RegExp(`^${regexPattern}$`);
-  return regex.test(fullPath);
-}
-
-/**
- * Get property depth (number of nested levels)
- */
-export function getPropertyDepth(access: PropertyAccess): number {
-  return access.propertyPath.length;
-}
-
-/**
- * Get top-level property (first in path)
- */
-export function getTopLevelProperty(access: PropertyAccess): string {
-  return access.propertyPath[0];
-}
-
-/**
- * Filter accesses by depth
- */
-export function filterByDepth(
-  accesses: PropertyAccess[],
-  minDepth: number,
-  maxDepth?: number
-): PropertyAccess[] {
-  return accesses.filter((access) => {
-    const depth = getPropertyDepth(access);
-    if (maxDepth !== undefined) {
-      return depth >= minDepth && depth <= maxDepth;
-    }
-    return depth >= minDepth;
-  });
 }
