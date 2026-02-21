@@ -5,7 +5,7 @@
 
 import { readFileSync, existsSync } from "fs";
 import { load as parseYaml } from "js-yaml";
-import { join } from "path";
+import { join, posix } from "path";
 
 /**
  * Parse Dockerfile to extract CMD or ENTRYPOINT
@@ -15,58 +15,47 @@ function parseDockerfile(dockerfilePath: string): string | null {
     return null;
   }
 
-  const content = readFileSync(dockerfilePath, "utf-8");
-  const lines = content.split("\n");
+  let content: string;
+  try {
+    content = readFileSync(dockerfilePath, "utf-8");
+  } catch {
+    return null;
+  }
+  // Join line continuations so multi-line instructions are seen as one line.
+  const lines = content.replace(/\\\r?\n/g, " ").split("\n");
 
-  // Look for CMD or ENTRYPOINT (skip HEALTHCHECK lines)
+  // The last CMD / ENTRYPOINT wins, as in Docker. `HEALTHCHECK ... CMD ...`
+  // lines (also when continued over several lines) are not entry points.
+  let entryPoint: string | null = null;
   let inHealthCheck = false;
   for (const line of lines) {
     const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
 
-    // Track if we're in a HEALTHCHECK block
-    if (line.includes("HEALTHCHECK")) {
+    if (/^HEALTHCHECK\b/i.test(trimmed)) {
       inHealthCheck = true;
       continue;
     }
+    // An indented CMD right after HEALTHCHECK is its command (older, continuation-less style).
+    if (inHealthCheck && /^\s/.test(line)) continue;
+    inHealthCheck = false;
 
-    // If we were in a HEALTHCHECK and this line doesn't continue it, exit HEALTHCHECK mode
-    if (inHealthCheck && !line.startsWith(" ") && !line.startsWith("\t")) {
-      inHealthCheck = false;
-    }
+    const instruction = trimmed.match(/^(CMD|ENTRYPOINT)\s+(.+)$/i);
+    if (!instruction) continue;
 
-    // Skip CMD lines that are part of HEALTHCHECK
-    if (inHealthCheck) {
-      continue;
-    }
-
-    // CMD ["node", "server.js"]
-    if (trimmed.startsWith("CMD")) {
-      const match = trimmed.match(/CMD\s+\[([^\]]+)\]/);
-      if (match) {
-        const parts = match[1].split(",").map((p) => p.trim().replace(/"/g, ""));
-        const commandStr = parts.join(" ");
-        return extractEntryPointFromCommand(commandStr);
-      }
-
-      // CMD node server.js
-      const shellMatch = trimmed.match(/CMD\s+(.+)/);
-      if (shellMatch) {
-        return extractEntryPointFromCommand(shellMatch[1]);
-      }
-    }
-
-    // ENTRYPOINT ["node", "server.js"]
-    if (trimmed.startsWith("ENTRYPOINT")) {
-      const match = trimmed.match(/ENTRYPOINT\s+\[([^\]]+)\]/);
-      if (match) {
-        const parts = match[1].split(",").map((p) => p.trim().replace(/"/g, ""));
-        const commandStr = parts.join(" ");
-        return extractEntryPointFromCommand(commandStr);
-      }
-    }
+    const args = instruction[2].trim();
+    const exec = args.match(/^\[(.*)\]$/);
+    const commandStr = exec
+      ? exec[1]
+          .split(",")
+          .map((p) => p.trim().replace(/^["']|["']$/g, ""))
+          .join(" ")
+      : args;
+    const found = extractEntryPointFromCommand(commandStr);
+    if (found) entryPoint = found;
   }
 
-  return null;
+  return entryPoint;
 }
 
 /**
@@ -75,34 +64,27 @@ function parseDockerfile(dockerfilePath: string): string | null {
 function extractEntryPointFromCommand(command: string | string[]): string | null {
   const commandStr = Array.isArray(command) ? command.join(" ") : command;
 
-  // Match patterns like: node server.js, python -m backend.api, uvicorn main:app
-  const patterns = [
-    /node\s+([^\s]+\.js)/,
-    /python\s+-m\s+([\w.]+)/,
-    /python\s+([^\s]+\.py)/,
-    /uvicorn\s+([\w:]+)/,
-    /npm\s+start/,
-  ];
+  if (typeof commandStr !== "string") return null;
 
-  for (const pattern of patterns) {
-    const match = commandStr.match(pattern);
-    if (match) {
-      const entryFile = match[1];
+  // node server.js / tsx src/index.ts / bun run app.ts
+  const scriptMatch = commandStr.match(
+    /\b(?:node|nodemon|ts-node|tsx|bun(?:\s+run)?|deno\s+run)\b(?:\s+-{1,2}[\w-]+(?:=\S+)?)*\s+([^\s"']+\.(?:[cm]?js|[cm]?ts))/
+  );
+  if (scriptMatch) return scriptMatch[1].replace(/^\.\//, "");
 
-      // Convert to file path
-      if (entryFile.endsWith(".js") || entryFile.endsWith(".py")) {
-        return entryFile;
-      } else if (entryFile.includes(":")) {
-        // uvicorn main:app -> main.py
-        const file = entryFile.split(":")[0];
-        return `${file}.py`;
-      } else {
-        // python -m backend.api -> backend/api.py
-        const file = entryFile.replace(/\./g, "/");
-        return `${file}.py`;
-      }
-    }
+  // python -m backend.api -> backend/api.py
+  const moduleMatch = commandStr.match(/\bpython[\d.]*\s+(?:-\w+\s+)*-m\s+([\w.]+)/);
+  if (moduleMatch && !["uvicorn", "gunicorn", "hypercorn"].includes(moduleMatch[1])) {
+    return `${moduleMatch[1].replace(/\./g, "/")}.py`;
   }
+
+  // python app.py
+  const pythonMatch = commandStr.match(/\bpython[\d.]*\s+(?:-\w+\s+)*([^\s"']+\.py)/);
+  if (pythonMatch) return pythonMatch[1].replace(/^\.\//, "");
+
+  // uvicorn main:app / gunicorn pkg.main:app -> main.py / pkg/main.py
+  const asgiMatch = commandStr.match(/\b(?:uvicorn|gunicorn|hypercorn)\b.*?\s([\w.]+):\w+/);
+  if (asgiMatch) return `${asgiMatch[1].replace(/\./g, "/")}.py`;
 
   return null;
 }
@@ -141,26 +123,43 @@ export function parseDockerCompose(projectRoot: string): DockerDependencyGraph {
 
   for (const file of composeFiles) {
     if (existsSync(file)) {
-      const content = readFileSync(file, "utf-8");
-      composeData = parseYaml(content) as any;
+      try {
+        composeData = parseYaml(readFileSync(file, "utf-8")) as any;
+      } catch {
+        // An unreadable or invalid compose file means "no Docker information".
+        return graph;
+      }
       break;
     }
   }
 
-  if (!composeData || !composeData.services) {
+  if (
+    !composeData ||
+    typeof composeData !== "object" ||
+    !composeData.services ||
+    typeof composeData.services !== "object"
+  ) {
     return graph;
   }
 
   // Parse each service
   for (const [serviceName, serviceConfig] of Object.entries(composeData.services)) {
-    const config = serviceConfig as any;
+    const config = (serviceConfig ?? {}) as any;
+    if (typeof config !== "object") continue;
+
+    const asText = (value: unknown): string | undefined =>
+      value === undefined || value === null
+        ? undefined
+        : Array.isArray(value)
+          ? value.join(" ")
+          : String(value);
 
     const service: DockerService = {
       name: serviceName,
       dependsOn: [],
       volumes: [],
-      entryPoint: config.entrypoint,
-      command: config.command,
+      entryPoint: asText(config.entrypoint),
+      command: asText(config.command),
     };
 
     // Extract depends_on
@@ -179,23 +178,34 @@ export function parseDockerCompose(projectRoot: string): DockerDependencyGraph {
         .map((v: string) => v.split(":")[0]);
     }
 
-    // Try to detect entry point file from docker-compose command
-    if (config.command) {
-      const entryFile = extractEntryPointFromCommand(config.command);
+    // Entry point paths are relative to the build context: make them relative to the project.
+    const buildContext =
+      typeof config.build === "string" ? config.build : config.build?.context ?? (config.build ? "." : null);
+    const inContext = (entryFile: string): string =>
+      typeof buildContext === "string" && !entryFile.startsWith("/")
+        ? posix.normalize(posix.join(buildContext.replace(/\\/g, "/"), entryFile))
+        : entryFile;
+
+    // Try to detect entry point file from docker-compose command / entrypoint
+    for (const command of [config.command, config.entrypoint]) {
+      if (!command || graph.entryPoints.has(serviceName)) continue;
+      const entryFile = extractEntryPointFromCommand(
+        Array.isArray(command) ? command.map(String) : String(command)
+      );
       if (entryFile) {
-        graph.entryPoints.set(serviceName, entryFile);
+        graph.entryPoints.set(serviceName, inContext(entryFile));
       }
     }
 
     // If no command in docker-compose, check Dockerfile
-    if (!graph.entryPoints.has(serviceName) && config.build) {
-      const buildContext = typeof config.build === "string" ? config.build : config.build.context;
-      if (buildContext) {
-        const dockerfilePath = join(projectRoot, buildContext, "Dockerfile");
-        const entryFile = parseDockerfile(dockerfilePath);
-        if (entryFile) {
-          graph.entryPoints.set(serviceName, entryFile);
-        }
+    if (!graph.entryPoints.has(serviceName) && typeof buildContext === "string") {
+      const dockerfileName =
+        typeof config.build === "object" && typeof config.build.dockerfile === "string"
+          ? config.build.dockerfile
+          : "Dockerfile";
+      const entryFile = parseDockerfile(join(projectRoot, buildContext, dockerfileName));
+      if (entryFile) {
+        graph.entryPoints.set(serviceName, inContext(entryFile));
       }
     }
 
@@ -245,4 +255,16 @@ export function calculateServiceBlastRadius(
   }
 
   return Array.from(affected);
+}
+
+/**
+ * True when `changedFile` (relative to the project root) is the file an entry
+ * point refers to. Entry points may be written relative to a container
+ * working directory, so a path-segment suffix match in either direction counts.
+ */
+export function matchesEntryPoint(changedFile: string, entryPoint: string): boolean {
+  const changed = changedFile.replace(/\\/g, "/").replace(/^\.\//, "");
+  const entry = entryPoint.replace(/\\/g, "/").replace(/^\.?\//, "");
+  if (!changed || !entry) return false;
+  return changed === entry || changed.endsWith(`/${entry}`) || entry.endsWith(`/${changed}`);
 }
