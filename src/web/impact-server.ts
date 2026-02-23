@@ -3,6 +3,7 @@
  */
 
 import express from "express";
+import type { Server } from "http";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { readFileSync, existsSync } from "fs";
@@ -14,58 +15,63 @@ export interface ServerOptions {
   port: number;
   impactDataPath: string;
   projectPath: string;
+  /** Interface to listen on. Defaults to 127.0.0.1 so the page is not reachable from the network. */
+  host?: string;
 }
 
-export function startVisualizationServer(options: ServerOptions): Promise<void> {
+/** Directory holding the built web app (web-dist/ next to dist/ in the package). */
+export function findWebDist(): string | null {
+  const candidates = [
+    join(__dirname, "../web-dist"), // dist/<chunk>.js -> <package>/web-dist
+    join(__dirname, "../../web-dist"), // src/web/impact-server.ts when run from source
+  ];
+  return candidates.find((dir) => existsSync(join(dir, "index.html"))) ?? null;
+}
+
+export function startVisualizationServer(options: ServerOptions): Promise<Server> {
   return new Promise((resolve, reject) => {
     const app = express();
-
-    // Serve static files from web-dist
-    // When compiled, __dirname is dist/, so ../web-dist is correct
-    const webDistPath = join(__dirname, "../web-dist");
-    app.use(express.static(webDistPath));
+    const webDistPath = findWebDist();
 
     // API endpoint to get impact data
-    app.get("/api/impact", (req, res) => {
+    app.get("/api/impact", (_req, res) => {
       try {
         if (!existsSync(options.impactDataPath)) {
-          return res.status(404).json({ error: "Impact data not found" });
+          res.status(404).json({ error: "Impact data not found. Run 'codemap visualize' again." });
+          return;
         }
-
-        const data = readFileSync(options.impactDataPath, "utf-8");
-        const impactData = JSON.parse(data);
-
-        res.json(impactData);
+        res.type("application/json").send(readFileSync(options.impactDataPath, "utf-8"));
       } catch (error) {
-        console.error("Error reading impact data:", error);
-        res.status(500).json({ error: "Failed to read impact data" });
+        res.status(500).json({ error: `Failed to read impact data: ${String(error)}` });
       }
     });
 
     // API endpoint to get project path
-    app.get("/api/project-path", (req, res) => {
+    app.get("/api/project-path", (_req, res) => {
       res.json({ path: options.projectPath });
     });
 
+    if (webDistPath) {
+      app.use(express.static(webDistPath));
+    }
+
     // Serve index.html for all other routes (SPA)
-    app.use((req, res) => {
-      const indexPath = join(webDistPath, "index.html");
-      if (existsSync(indexPath)) {
-        res.sendFile(indexPath);
+    app.use((_req, res) => {
+      if (webDistPath) {
+        res.sendFile(join(webDistPath, "index.html"));
       } else {
-        res.status(404).send("Web dist not found. Please run: npm run build:web");
+        res
+          .status(500)
+          .type("text/plain")
+          .send("The web app is missing from this installation (web-dist/). Reinstall codemap-ai, or run `npm run build:web` in a source checkout.");
       }
     });
 
-    const server = app.listen(options.port, () => {
-      console.log(`\n🌐 Visualization server running at:`);
-      console.log(`   http://localhost:${options.port}\n`);
-      resolve();
-    });
+    const server = app.listen(options.port, options.host ?? "127.0.0.1", () => resolve(server));
 
     server.on("error", (error: NodeJS.ErrnoException) => {
       if (error.code === "EADDRINUSE") {
-        reject(new Error(`Port ${options.port} is already in use`));
+        reject(new Error(`Port ${options.port} is already in use. Pass --port <number> to use another one.`));
       } else {
         reject(error);
       }
