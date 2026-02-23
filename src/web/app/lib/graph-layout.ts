@@ -9,49 +9,42 @@ export interface LayoutOptions {
   };
 }
 
-export async function getLayoutedElements(
-  nodes: Node[],
+/** Rendered size of a function node (see ImpactGraph). */
+const NODE_WIDTH = 300;
+const NODE_HEIGHT = 110;
+
+export async function getLayoutedElements<N extends Node>(
+  nodes: N[],
   edges: Edge[],
   options: LayoutOptions = {}
-): Promise<{ nodes: Node[]; edges: Edge[] }> {
-  const direction = options.direction || 'TB';
-  const nodeWidth = 350;
-  const nodeHeight = 140;
-  const rankSep = options.spacing?.rank || 300;
-  const nodeSep = options.spacing?.node || 200;
-
+): Promise<{ nodes: N[]; edges: Edge[] }> {
   const dagreGraph = new dagre.graphlib.Graph();
   dagreGraph.setDefaultEdgeLabel(() => ({}));
   dagreGraph.setGraph({
-    rankdir: direction,
-    ranksep: rankSep,
-    nodesep: nodeSep,
-    edgesep: 100,
-    marginx: 50,
-    marginy: 50,
+    rankdir: options.direction || 'TB',
+    ranksep: options.spacing?.rank ?? 120,
+    nodesep: options.spacing?.node ?? 60,
+    edgesep: 20,
+    marginx: 40,
+    marginy: 40,
   });
 
-  // Add nodes
-  nodes.forEach((node) => {
-    dagreGraph.setNode(node.id, { width: nodeWidth, height: nodeHeight });
-  });
-
-  // Add edges
-  edges.forEach((edge) => {
+  for (const node of nodes) {
+    dagreGraph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+  }
+  for (const edge of edges) {
     dagreGraph.setEdge(edge.source, edge.target);
-  });
+  }
 
-  // Calculate layout
   dagre.layout(dagreGraph);
 
-  // Apply positions to nodes
   const layoutedNodes = nodes.map((node) => {
-    const nodeWithPosition = dagreGraph.node(node.id);
+    const position = dagreGraph.node(node.id);
     return {
       ...node,
       position: {
-        x: nodeWithPosition.x - nodeWidth / 2,
-        y: nodeWithPosition.y - nodeHeight / 2,
+        x: position.x - NODE_WIDTH / 2,
+        y: position.y - NODE_HEIGHT / 2,
       },
     };
   });

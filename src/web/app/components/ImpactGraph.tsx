@@ -1,21 +1,26 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import {
   ReactFlow,
-  Node,
-  Edge,
   Controls,
   Background,
   useNodesState,
   useEdgesState,
+  useReactFlow,
+  ReactFlowProvider,
   BackgroundVariant,
   MiniMap,
   MarkerType,
+  Handle,
+  Position,
+  type Node,
+  type Edge,
+  type NodeProps,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import type { ImpactNode, ImpactData } from '../types';
 import { getLayoutedElements, getSeverityColor } from '../lib/graph-layout';
-import { Badge } from './ui/badge';
-import { AlertCircle, GitBranch, ArrowDown } from 'lucide-react';
+import { fileName } from '../lib/paths';
+import { AlertCircle, GitBranch } from 'lucide-react';
 import { cn } from '../lib/utils';
 
 interface Props {
@@ -24,67 +29,59 @@ interface Props {
   onNodeSelect: (nodeId: string | null) => void;
 }
 
-function FunctionNode({ data }: { data: ImpactNode }) {
+// React Flow requires node data to be an index-signature record.
+type FunctionNodeData = ImpactNode & { selected?: boolean } & Record<string, unknown>;
+type FunctionFlowNode = Node<FunctionNodeData, 'functionNode'>;
+
+function FunctionNode({ data }: NodeProps<FunctionFlowNode>) {
   const severityColor = getSeverityColor(data.severity);
-  const bgGradient = data.isChanged
-    ? 'from-red-50 via-red-100 to-red-50 dark:from-red-950 dark:via-red-900 dark:to-red-950'
-    : data.severity === 'HIGH'
-    ? 'from-orange-50 via-orange-100 to-orange-50 dark:from-orange-950 dark:via-orange-900 dark:to-orange-950'
-    : 'from-blue-50 via-blue-100 to-blue-50 dark:from-blue-950 dark:via-blue-900 dark:to-blue-950';
 
   return (
     <div
       className={cn(
-        'px-6 py-5 rounded-2xl border-2 bg-gradient-to-br shadow-lg hover:shadow-xl transition-all duration-200',
-        'min-w-[280px] max-w-[320px]',
-        bgGradient
+        'px-4 py-3 rounded-xl border-2 bg-slate-900 text-slate-100 shadow-lg transition-shadow',
+        'w-[300px]',
+        data.selected && 'ring-4 ring-blue-500/60'
       )}
-      style={{ borderColor: severityColor, borderWidth: '3px' }}
+      style={{ borderColor: severityColor }}
     >
+      <Handle type="target" position={Position.Top} className="!bg-slate-500 !border-slate-300" />
       <div className="flex items-start gap-3">
-        <div
-          className="rounded-xl p-2.5 shadow-sm"
-          style={{ backgroundColor: severityColor + '25' }}
-        >
+        <div className="rounded-lg p-2" style={{ backgroundColor: severityColor + '26' }}>
           {data.isChanged ? (
-            <AlertCircle className="w-6 h-6" style={{ color: severityColor }} strokeWidth={2.5} />
+            <AlertCircle className="w-5 h-5" style={{ color: severityColor }} strokeWidth={2.5} />
           ) : (
-            <GitBranch className="w-6 h-6" style={{ color: severityColor }} strokeWidth={2.5} />
+            <GitBranch className="w-5 h-5" style={{ color: severityColor }} strokeWidth={2.5} />
           )}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="font-mono font-bold text-base truncate">{data.name}()</span>
+          <div className="flex items-center gap-2 mb-1">
+            <span className="font-mono font-bold text-sm truncate" title={data.name}>
+              {data.name}()
+            </span>
             {data.isChanged && (
-              <Badge variant="destructive" className="text-xs px-2 py-0.5">
-                Modified
-              </Badge>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-500/20 text-red-300 font-bold">
+                MODIFIED
+              </span>
             )}
           </div>
-          <div className="text-xs text-muted-foreground truncate mb-3">
-            📄 {data.filePath.split('/').pop()}:{data.line}
+          <div className="text-xs text-slate-400 truncate mb-2" title={data.filePath}>
+            {fileName(data.filePath)}:{data.line}
           </div>
           <div className="flex gap-2 items-center">
-            <Badge
-              variant="outline"
-              className="text-xs font-bold px-2 py-1"
-              style={{
-                backgroundColor: severityColor + '15',
-                borderColor: severityColor,
-                color: severityColor,
-                borderWidth: '2px'
-              }}
+            <span
+              className="text-[10px] font-bold px-1.5 py-0.5 rounded border"
+              style={{ color: severityColor, borderColor: severityColor, backgroundColor: severityColor + '1a' }}
             >
               {data.severity}
-            </Badge>
-            <div className="text-xs text-muted-foreground font-medium">
-              <span className="inline-flex items-center gap-1">
-                ↑ {data.callerCount} • ↓ {data.calleeCount}
-              </span>
-            </div>
+            </span>
+            <span className="text-xs text-slate-400" title="callers / callees in the whole project">
+              ↑ {data.callerCount} · ↓ {data.calleeCount}
+            </span>
           </div>
         </div>
       </div>
+      <Handle type="source" position={Position.Bottom} className="!bg-slate-500 !border-slate-300" />
     </div>
   );
 }
@@ -93,66 +90,77 @@ const nodeTypes = {
   functionNode: FunctionNode,
 };
 
-export function ImpactGraph({ data, selectedNodeId, onNodeSelect }: Props) {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+function Graph({ data, selectedNodeId, onNodeSelect }: Props) {
+  const [nodes, setNodes, onNodesChange] = useNodesState<FunctionFlowNode>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const { fitView } = useReactFlow();
 
+  // Layout once per data set
   useEffect(() => {
+    let cancelled = false;
     async function layoutGraph() {
       setIsLoading(true);
 
-      const initialNodes: Node[] = data.nodes.map((n) => ({
+      const initialNodes: FunctionFlowNode[] = data.nodes.map((n) => ({
         id: n.id,
         type: 'functionNode',
-        data: n,
+        data: { ...n },
         position: { x: 0, y: 0 },
       }));
 
-      const initialEdges: Edge[] = data.edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        type: 'smoothstep',
-        animated: e.isOnCriticalPath,
-        style: {
-          strokeWidth: 3,
-          stroke: e.isOnCriticalPath ? '#3b82f6' : '#64748b',
-        },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: e.isOnCriticalPath ? '#3b82f6' : '#64748b',
-          width: 25,
-          height: 25,
-        },
-        label: e.isOnCriticalPath ? 'calls' : undefined,
-        labelStyle: {
-          fontSize: 11,
-          fontWeight: 600,
-          fill: '#3b82f6',
-        },
-        labelBgStyle: {
-          fill: '#eff6ff',
-          fillOpacity: 0.9,
-        },
-      }));
+      const nodeIds = new Set(data.nodes.map((n) => n.id));
+      const initialEdges: Edge[] = data.edges
+        .filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target))
+        .map((e) => {
+          const color = e.isOnCriticalPath ? '#60a5fa' : '#64748b';
+          return {
+            id: e.id,
+            source: e.source,
+            target: e.target,
+            type: 'smoothstep',
+            animated: e.isOnCriticalPath,
+            style: { strokeWidth: 2, stroke: color },
+            markerEnd: { type: MarkerType.ArrowClosed, color, width: 18, height: 18 },
+          };
+        });
 
-      const { nodes: layoutedNodes, edges: layoutedEdges } = await getLayoutedElements(
-        initialNodes,
-        initialEdges,
-        {
-          direction: 'TB',
-          spacing: { node: 200, rank: 300 },
-        }
-      );
+      const layouted = await getLayoutedElements(initialNodes, initialEdges, {
+        direction: 'TB',
+        spacing: { node: 60, rank: 120 },
+      });
+      if (cancelled) return;
 
-      setNodes(layoutedNodes);
-      setEdges(layoutedEdges);
+      setNodes(layouted.nodes);
+      setEdges(layouted.edges);
       setIsLoading(false);
     }
 
     layoutGraph();
+    return () => {
+      cancelled = true;
+    };
   }, [data, setNodes, setEdges]);
+
+  // Highlight the selected node and its edges, and bring it into view
+  useEffect(() => {
+    setNodes((current) =>
+      current.map((node) =>
+        node.data.selected === (node.id === selectedNodeId)
+          ? node
+          : { ...node, data: { ...node.data, selected: node.id === selectedNodeId } }
+      )
+    );
+    setEdges((current) =>
+      current.map((edge) => {
+        const touches = selectedNodeId !== null && (edge.source === selectedNodeId || edge.target === selectedNodeId);
+        return { ...edge, style: { ...edge.style, opacity: selectedNodeId && !touches ? 0.25 : 1 } };
+      })
+    );
+    if (selectedNodeId) {
+      fitView({ nodes: [{ id: selectedNodeId }], duration: 400, maxZoom: 1.2 });
+    }
+  }, [selectedNodeId, setNodes, setEdges, fitView, isLoading]);
 
   const onNodeClickHandler = useCallback(
     (_: React.MouseEvent, node: Node) => {
@@ -190,27 +198,29 @@ export function ImpactGraph({ data, selectedNodeId, onNodeSelect }: Props) {
         onPaneClick={onPaneClick}
         nodeTypes={nodeTypes}
         fitView
-        minZoom={0.1}
+        fitViewOptions={{ padding: 0.15, maxZoom: 1 }}
+        minZoom={0.05}
         maxZoom={1.5}
-        defaultViewport={{ x: 0, y: 0, zoom: 0.8 }}
+        colorMode="dark"
         proOptions={{ hideAttribution: true }}
       >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={20}
-          size={2}
-          color="#94a3b8"
-        />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1.5} color="#334155" />
         <Controls showInteractive={false} />
         <MiniMap
-          nodeColor={(node) => {
-            const data = node.data as ImpactNode;
-            return getSeverityColor(data.severity);
-          }}
-          className="border-2 border-border shadow-lg"
-          maskColor="rgb(240, 240, 240, 0.6)"
+          nodeColor={(node) => getSeverityColor((node.data as FunctionNodeData).severity)}
+          maskColor="rgba(2, 6, 23, 0.7)"
+          pannable
+          zoomable
         />
       </ReactFlow>
     </div>
+  );
+}
+
+export function ImpactGraph(props: Props) {
+  return (
+    <ReactFlowProvider>
+      <Graph {...props} />
+    </ReactFlowProvider>
   );
 }
