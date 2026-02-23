@@ -2,188 +2,180 @@
  * Export impact analysis data for visualization
  */
 
+import { writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
 import { FlowStorage } from "../flow/storage.js";
 import type { ImpactData, ImpactNode, ImpactEdge, SeverityLevel } from "../web/app/types.js";
-import { writeFileSync } from "fs";
-import { join } from "path";
+import type { ImpactResult } from "./impact.js";
 
-export interface ImpactAnalysisResult {
-  changedFiles: string[];
-  changedFunctions: Array<{ functionName: string; file: string; lineNumber: number }>;
-  directCallers: Map<string, Array<{ id: string; name: string; file: string; line: number }>>;
-  removedCallImpacts?: Array<{
-    severity: string;
-    removedCall: any;
-    stillCalledBy: any[];
-    impactedFunctions: any[];
-  }>;
+/** The parts of an {@link ImpactResult} the visualization uses. */
+export type ImpactAnalysisResult = Pick<
+  ImpactResult,
+  "changedFiles" | "changedFunctions" | "directCallers" | "removedCallImpacts"
+> &
+  Partial<Pick<ImpactResult, "riskLevel" | "affectedEndpoints" | "dataFlowChanges">>;
+
+const SEVERITY_ORDER: SeverityLevel[] = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+
+function maxSeverity(a: SeverityLevel, b: SeverityLevel): SeverityLevel {
+  return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
 }
 
-export function exportImpactForVisualization(
+/** Build the data the web view renders. */
+export function buildImpactData(
   result: ImpactAnalysisResult,
   storage: FlowStorage,
-  outputPath: string
-): void {
-  const nodes: ImpactNode[] = [];
-  const edges: ImpactEdge[] = [];
-  const nodesAdded = new Set<string>();
-  const edgesAdded = new Set<string>();
+  projectPath: string
+): ImpactData {
+  const nodes = new Map<string, ImpactNode>();
+  const edges = new Map<string, ImpactEdge>();
 
-  // Helper to determine severity
-  function getSeverity(isChanged: boolean, depth: number): SeverityLevel {
-    if (isChanged) return "CRITICAL";
-    if (depth === 1) return "HIGH";
-    if (depth === 2) return "MEDIUM";
-    return "LOW";
+  const addNode = (node: ImpactNode): ImpactNode => {
+    const existing = nodes.get(node.id);
+    if (!existing) {
+      nodes.set(node.id, node);
+      return node;
+    }
+    existing.severity = maxSeverity(existing.severity, node.severity);
+    existing.isChanged = existing.isChanged || node.isChanged;
+    existing.hasBreakingChanges = existing.hasBreakingChanges || node.hasBreakingChanges;
+    return existing;
+  };
+
+  const addEdge = (source: string, target: string, critical: boolean, type: ImpactEdge["type"]): void => {
+    if (source === target) return;
+    const id = `${source}->${target}`;
+    const existing = edges.get(id);
+    if (existing) {
+      existing.isOnCriticalPath = existing.isOnCriticalPath || critical;
+      return;
+    }
+    edges.set(id, { id, source, target, type, isOnCriticalPath: critical });
+  };
+
+  const nodeType = (type: string): ImpactNode["type"] => (type === "method" ? "method" : "function");
+
+  // Changed functions (roots)
+  const changedIdByName = new Map<string, string>();
+  for (const changed of result.changedFunctions) {
+    if (!changed.nodeId) continue;
+    const dbNode = storage.getNode(changed.nodeId);
+    if (!dbNode) continue;
+    changedIdByName.set(changed.functionName, dbNode.id);
+    addNode({
+      id: dbNode.id,
+      name: changed.functionName,
+      filePath: dbNode.filePath,
+      line: dbNode.startLine,
+      type: nodeType(dbNode.type),
+      severity: "CRITICAL",
+      isChanged: true,
+      calleeCount: 0,
+      callerCount: 0,
+    });
   }
 
-  // Add changed functions (root nodes)
-  for (const changedFunc of result.changedFunctions) {
-    // Find node in database - use absolute path
-    const absolutePath = join(outputPath, changedFunc.file);
-    const dbNode = storage.db
-      .prepare(`SELECT * FROM nodes WHERE file_path = ? AND name = ?`)
-      .get(absolutePath, changedFunc.functionName) as any;
-
-    if (dbNode) {
-      const node: ImpactNode = {
-        id: dbNode.id,
-        name: dbNode.name,
-        filePath: dbNode.file_path,
-        line: dbNode.start_line,
-        type: dbNode.type === "method" ? "method" : "function",
-        severity: "CRITICAL",
-        isChanged: true,
+  // Direct callers (depth 1)
+  for (const [funcName, callers] of result.directCallers.entries()) {
+    const changedId = changedIdByName.get(funcName);
+    for (const caller of callers) {
+      if (!caller.id) continue;
+      const dbNode = storage.getNode(caller.id);
+      addNode({
+        id: caller.id,
+        name: caller.name,
+        filePath: caller.file,
+        line: caller.line,
+        type: nodeType(dbNode?.type ?? "function"),
+        severity: "HIGH",
+        isChanged: false,
         calleeCount: 0,
         callerCount: 0,
-      };
-      nodes.push(node);
-      nodesAdded.add(dbNode.id);
+      });
+      if (changedId) addEdge(caller.id, changedId, true, "direct");
     }
   }
 
-  // Add direct callers (depth 1)
-  for (const [funcName, callers] of result.directCallers.entries()) {
-    // Find the changed function node ID for this function name
-    const changedFunc = result.changedFunctions.find(f => f.functionName === funcName);
-    if (!changedFunc) continue;
-
-    const absolutePath = join(outputPath, changedFunc.file);
-    const changedFuncNode = storage.db
-      .prepare(`SELECT id FROM nodes WHERE file_path = ? AND name = ?`)
-      .get(absolutePath, changedFunc.functionName) as any;
-
-    if (!changedFuncNode || !changedFuncNode.id) continue;
-
-    for (const caller of callers) {
-      // Skip if caller doesn't have a valid ID
-      if (!caller.id) continue;
-
-      if (!nodesAdded.has(caller.id)) {
-        const node: ImpactNode = {
-          id: caller.id,
-          name: caller.name,
-          filePath: caller.file,
-          line: caller.line,
-          type: "function",
-          severity: "HIGH",
-          isChanged: false,
-          calleeCount: 0,
-          callerCount: 0,
-        };
-        nodes.push(node);
-        nodesAdded.add(caller.id);
-      }
-
-      // Add edge from caller to changed function
-      const edgeId = `${caller.id}-${changedFuncNode.id}`;
-      if (!edgesAdded.has(edgeId)) {
-        edges.push({
-          id: edgeId,
-          source: caller.id,
-          target: changedFuncNode.id,
-          type: "direct",
-          isOnCriticalPath: true,
-        });
-        edgesAdded.add(edgeId);
-      }
+  // Removed call impacts: the function that lost the call, and everything that depends on it
+  for (const impact of result.removedCallImpacts ?? []) {
+    const severity = impact.severity as SeverityLevel;
+    const fromId = impact.removedCall.removedFromId ?? undefined;
+    for (const impacted of impact.impactedFunctions) {
+      if (!impacted.id) continue;
+      const dbNode = storage.getNode(impacted.id);
+      addNode({
+        id: impacted.id,
+        name: impacted.name,
+        filePath: impacted.file,
+        line: impacted.line,
+        type: nodeType(dbNode?.type ?? "function"),
+        severity: severity === "CRITICAL" ? "HIGH" : severity,
+        isChanged: false,
+        calleeCount: 0,
+        callerCount: 0,
+        hasBreakingChanges: true,
+      });
     }
-  }
-
-  // Add removed call impacts
-  if (result.removedCallImpacts) {
-    for (const impact of result.removedCallImpacts) {
-      // Add impacted functions
-      for (const impactedFunc of impact.impactedFunctions) {
-        // Skip if function doesn't have a valid ID
-        if (!impactedFunc.id) continue;
-
-        if (!nodesAdded.has(impactedFunc.id)) {
-          const node: ImpactNode = {
-            id: impactedFunc.id,
-            name: impactedFunc.name,
-            filePath: impactedFunc.file,
-            line: impactedFunc.line,
-            type: "function",
-            severity: impact.severity as SeverityLevel,
-            isChanged: false,
-            calleeCount: 0,
-            callerCount: 0,
-            hasBreakingChanges: true,
-          };
-          nodes.push(node);
-          nodesAdded.add(impactedFunc.id);
+    // Connect impacted functions along real call edges.
+    const impactedIds = new Set(impact.impactedFunctions.map((f) => f.id));
+    if (fromId) impactedIds.add(fromId);
+    for (const id of impactedIds) {
+      for (const callee of storage.getResolvedCallees(id)) {
+        if (impactedIds.has(callee.id) && nodes.has(callee.id) && nodes.has(id)) {
+          addEdge(id, callee.id, severity === "CRITICAL", "indirect");
         }
       }
     }
   }
 
-  // Calculate caller/callee counts
-  for (const node of nodes) {
-    const callees = storage.db
-      .prepare(`SELECT COUNT(*) as count FROM edges WHERE source_id = ?`)
-      .get(node.id) as any;
-    const callers = storage.db
-      .prepare(`SELECT COUNT(*) as count FROM edges WHERE target_id = ?`)
-      .get(node.id) as any;
-    node.calleeCount = callees?.count || 0;
-    node.callerCount = callers?.count || 0;
+  // Caller/callee counts from the full graph
+  const countCallees = storage.db.prepare(
+    `SELECT COUNT(DISTINCT target_id) AS count FROM edges WHERE source_id = ? AND type = 'calls' AND target_id NOT LIKE 'ref:%'`
+  );
+  const countCallers = storage.db.prepare(
+    `SELECT COUNT(DISTINCT source_id) AS count FROM edges WHERE target_id = ? AND type = 'calls'`
+  );
+  for (const node of nodes.values()) {
+    node.calleeCount = (countCallees.get(node.id) as { count: number }).count;
+    node.callerCount = (countCallers.get(node.id) as { count: number }).count;
   }
 
-  // Calculate statistics
-  const bySeverity: Record<SeverityLevel, number> = {
-    CRITICAL: 0,
-    HIGH: 0,
-    MEDIUM: 0,
-    LOW: 0,
-  };
+  const nodeList = [...nodes.values()];
+  const bySeverity: Record<SeverityLevel, number> = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  for (const node of nodeList) bySeverity[node.severity]++;
 
-  for (const node of nodes) {
-    bySeverity[node.severity]++;
-  }
-
-  const filesAffected = new Set(nodes.map(n => n.filePath)).size;
-
-  const impactData: ImpactData = {
-    nodes,
-    edges,
+  return {
+    nodes: nodeList,
+    edges: [...edges.values()],
     changedFiles: result.changedFiles,
     statistics: {
-      totalAffected: nodes.length,
+      totalAffected: nodeList.length,
       bySeverity,
       byDepth: {
-        0: result.changedFunctions.length,
-        1: Array.from(result.directCallers.values()).reduce((sum, arr) => sum + arr.length, 0),
+        0: nodeList.filter((n) => n.isChanged).length,
+        1: new Set([...result.directCallers.values()].flat().map((c) => c.id)).size,
       },
-      filesAffected,
+      filesAffected: new Set(nodeList.map((n) => n.filePath)).size,
     },
     timestamp: new Date().toISOString(),
-    analysisPath: outputPath,
+    analysisPath: projectPath,
+    riskLevel: result.riskLevel,
+    affectedEndpoints: result.affectedEndpoints ?? [],
   };
+}
 
-  // Write to file
-  const outputFile = join(outputPath, ".codemap", "impact.json");
+/**
+ * Write `<project>/.codemap/impact.json` for the web view and return its path.
+ */
+export function exportImpactForVisualization(
+  result: ImpactAnalysisResult,
+  storage: FlowStorage,
+  outputPath: string
+): string {
+  const impactData = buildImpactData(result, storage, outputPath);
+  const dir = join(outputPath, ".codemap");
+  mkdirSync(dir, { recursive: true });
+  const outputFile = join(dir, "impact.json");
   writeFileSync(outputFile, JSON.stringify(impactData, null, 2));
-
-  console.log(`\n  📊 Impact data exported to: ${outputFile}`);
+  return outputFile;
 }

@@ -34,6 +34,10 @@ export interface ImpactData {
   };
   timestamp: string;
   analysisPath: string;
+  /** Overall risk of the change set (added in 3.9). */
+  riskLevel?: SeverityLevel;
+  /** HTTP endpoints served by changed functions or their direct callers (added in 3.9). */
+  affectedEndpoints?: string[];
 }
 
 export interface PropertyAccess {
