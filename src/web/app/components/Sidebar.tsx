@@ -1,8 +1,8 @@
-import React from 'react';
 import type { ImpactData } from '../types';
 import { getSeverityColor } from '../lib/graph-layout';
 import { FileCode, AlertCircle, GitBranch, ChevronRight } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { relativePath } from '../lib/paths';
 
 interface Props {
   data: ImpactData;
@@ -69,7 +69,7 @@ export function Sidebar({ data, selectedNodeId, onNodeSelect }: Props) {
           </div>
 
           {Object.entries(nodesByFile).map(([filePath, nodes]) => {
-            const fileName = filePath.split('/').pop() || filePath;
+            const displayPath = relativePath(filePath, data.analysisPath);
             const highestSeverity = nodes.reduce((max, node) => {
               const severities = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
               const maxIdx = severities.indexOf(max);
@@ -89,8 +89,12 @@ export function Sidebar({ data, selectedNodeId, onNodeSelect }: Props) {
                   style={{ borderLeftColor: severityColor }}
                 >
                   <FileCode className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
-                  <span className="text-xs font-medium text-slate-200 truncate flex-1" title={fileName}>
-                    {fileName}
+                  <span
+                    className="text-xs font-medium text-slate-200 truncate flex-1"
+                    title={displayPath}
+                    style={{ direction: 'rtl', textAlign: 'left' }}
+                  >
+                    {displayPath}
                   </span>
                   <div
                     className="w-1.5 h-1.5 rounded-full"
