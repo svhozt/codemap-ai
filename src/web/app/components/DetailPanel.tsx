@@ -1,7 +1,7 @@
-import React from 'react';
 import type { ImpactNode, ImpactData } from '../types';
 import { getSeverityColor } from '../lib/graph-layout';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
+import { relativePath, fileName } from '../lib/paths';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { X, AlertCircle, ArrowDownCircle, ArrowUpCircle, FileCode } from 'lucide-react';
@@ -10,20 +10,25 @@ interface Props {
   node: ImpactNode;
   data: ImpactData;
   onClose: () => void;
+  onNavigate: (nodeId: string) => void;
 }
 
-export function DetailPanel({ node, data, onClose }: Props) {
+function isNode(node: ImpactNode | undefined): node is ImpactNode {
+  return node !== undefined;
+}
+
+export function DetailPanel({ node, data, onClose, onNavigate }: Props) {
   const severityColor = getSeverityColor(node.severity);
 
   const callees = data.edges
     .filter(e => e.source === node.id)
     .map(e => data.nodes.find(n => n.id === e.target))
-    .filter(Boolean);
+    .filter(isNode);
 
   const callers = data.edges
     .filter(e => e.target === node.id)
     .map(e => data.nodes.find(n => n.id === e.source))
-    .filter(Boolean);
+    .filter(isNode);
 
   return (
     <>
@@ -68,7 +73,7 @@ export function DetailPanel({ node, data, onClose }: Props) {
                   </Badge>
                 </div>
                 <div className="text-sm text-slate-400 mt-1 font-mono">
-                  {node.filePath.split('/').slice(-3).join('/')}:{node.line}
+                  {relativePath(node.filePath, data.analysisPath)}:{node.line}
                 </div>
               </div>
             </div>
@@ -89,24 +94,26 @@ export function DetailPanel({ node, data, onClose }: Props) {
             <CardHeader className="pb-3">
               <CardTitle className="text-base flex items-center gap-2 text-slate-100">
                 <ArrowUpCircle className="w-5 h-5 text-blue-400" />
-                Called By ({callers.length})
+                Called By ({callers.length}{node.callerCount > callers.length ? ` of ${node.callerCount} in project` : ''})
               </CardTitle>
             </CardHeader>
             <CardContent>
               {callers.length > 0 ? (
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
                   {callers.slice(0, 10).map(caller => (
-                    <div
+                    <button
+                      type="button"
                       key={caller.id}
-                      className="p-3 rounded-lg bg-slate-800/50 hover:bg-slate-800 transition-colors cursor-pointer"
+                      onClick={() => onNavigate(caller.id)}
+                      className="w-full text-left p-3 rounded-lg bg-slate-800/50 hover:bg-slate-800 transition-colors cursor-pointer"
                     >
                       <div className="text-sm font-mono font-medium text-slate-200 truncate">
                         {caller.name}()
                       </div>
                       <div className="text-xs text-slate-400 truncate mt-1">
-                        📄 {caller.filePath.split('/').pop()}
+                        📄 {fileName(caller.filePath)}:{caller.line}
                       </div>
-                    </div>
+                    </button>
                   ))}
                   {callers.length > 10 && (
                     <div className="text-sm text-slate-400 text-center py-2">
@@ -134,17 +141,19 @@ export function DetailPanel({ node, data, onClose }: Props) {
               {callees.length > 0 ? (
                 <div className="space-y-2 max-h-64 overflow-y-auto pr-2">
                   {callees.slice(0, 10).map(callee => (
-                    <div
+                    <button
+                      type="button"
                       key={callee.id}
-                      className="p-3 rounded-lg bg-slate-800/50 hover:bg-slate-800 transition-colors cursor-pointer"
+                      onClick={() => onNavigate(callee.id)}
+                      className="w-full text-left p-3 rounded-lg bg-slate-800/50 hover:bg-slate-800 transition-colors cursor-pointer"
                     >
                       <div className="text-sm font-mono font-medium text-slate-200 truncate">
                         {callee.name}()
                       </div>
                       <div className="text-xs text-slate-400 truncate mt-1">
-                        📄 {callee.filePath.split('/').pop()}
+                        📄 {fileName(callee.filePath)}:{callee.line}
                       </div>
-                    </div>
+                    </button>
                   ))}
                   {callees.length > 10 && (
                     <div className="text-sm text-slate-400 text-center py-2">
@@ -169,10 +178,10 @@ export function DetailPanel({ node, data, onClose }: Props) {
                 <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" />
                 <div>
                   <div className="text-sm font-semibold text-red-400">
-                    Breaking Change Detected
+                    Possibly Broken by This Change
                   </div>
                   <div className="text-xs text-red-300/80 mt-1">
-                    This function's signature or behavior has changed and may break existing callers.
+                    A call this function depends on was removed, or data it reads is no longer returned. Check it still behaves correctly.
                   </div>
                 </div>
               </div>
