@@ -1,5 +1,14 @@
 import { defineConfig } from "tsup";
 
+/** Native modules (and their grammars) are loaded from node_modules at runtime. */
+const external = [
+  "tree-sitter",
+  "tree-sitter-python",
+  "tree-sitter-javascript",
+  "tree-sitter-typescript",
+  "better-sqlite3",
+];
+
 export default defineConfig([
   // CLI entry - with shebang
   {
@@ -8,18 +17,12 @@ export default defineConfig([
     dts: true,
     clean: true,
     sourcemap: true,
-    target: "node18",
+    target: "node20",
     shims: true,
     banner: {
-      js: "#!/usr/bin/env node\n",
+      js: "#!/usr/bin/env node",
     },
-    external: [
-      "tree-sitter",
-      "tree-sitter-python",
-      "tree-sitter-javascript",
-      "tree-sitter-typescript",
-      "better-sqlite3",
-    ],
+    external,
   },
   // Library and MCP server - no shebang
   {
@@ -31,14 +34,8 @@ export default defineConfig([
     dts: true,
     clean: false,
     sourcemap: true,
-    target: "node18",
+    target: "node20",
     shims: true,
-    external: [
-      "tree-sitter",
-      "tree-sitter-python",
-      "tree-sitter-javascript",
-      "tree-sitter-typescript",
-      "better-sqlite3",
-    ],
+    external,
   },
 ]);
