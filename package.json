@@ -11,11 +11,11 @@
   },
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/svhozt/codemap-ai.git"
   },
-  "homepage": "",
+  "homepage": "https://github.com/svhozt/codemap-ai#readme",
   "bugs": {
-    "url": ""
+    "url": "https://github.com/svhozt/codemap-ai/issues"
   },
   "scripts": {
     "build": "tsup && npm run build:web",
@@ -49,7 +49,7 @@
     "cli"
   ],
   "author": "Sahan Nishshanka",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "engines": {
     "node": ">=20.0.0"
   },
@@ -102,6 +102,7 @@
     "web-dist",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ]
 }
