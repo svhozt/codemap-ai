@@ -3,6 +3,11 @@ node_modules/
 
 # Build output
 dist/
+web-dist/
+src/web/app/dist/
+
+# Test output
+coverage/
 
 # Logs
 *.log
@@ -18,7 +23,7 @@ yarn-error.log*
 .Trashes
 Thumbs.db
 
-# CodeMap data
+# CodeMap data (the index is local to each checkout)
 .codemap/
 
 # IDE
@@ -28,15 +33,16 @@ Thumbs.db
 *.swo
 *~
 
-# Test files
-test-*.js
+# Backups
+*.bak
+*.orig
+
+# Packed tarballs
+*.tgz
 
 # Environment
 .env
-.env.local
-
-# Web build output
-web-dist/
+.env.*
 
 # Local Claude Code settings
 .claude/settings.local.json
