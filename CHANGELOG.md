@@ -5,6 +5,113 @@ All notable changes to CodeMap AI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+This release prepares CodeMap for its open-source repository. CLI commands and
+options, MCP tool names and arguments, and the library exports are unchanged
+or extended. Indexes built by earlier versions are rebuilt automatically by
+`codemap index` / `impact`; until then the MCP tools ask for `codemap reindex`.
+
+### Changed
+- **License: Apache License 2.0** (previously MIT). Added a `NOTICE` file.
+  Releases up to 3.8.0 remain available under MIT.
+- **`codemap init` registers the MCP server in the project's `.mcp.json`**, the
+  project-scoped configuration Claude Code reads. It used to edit
+  `~/.claude/config.json`, which Claude Code does not read, so the automatic
+  setup never took effect. Other servers in `.mcp.json` are kept.
+- **Much more accurate call graph.**
+  - TypeScript/JavaScript calls are attributed to the function that makes them
+    (previously all to the file).
+  - Arrow functions get their real names (no more `anonymous` nodes).
+  - Methods keep their class.
+  - Class fields, object-literal namespaces, `exports.x = function` and
+    wrapped components (`memo(() => ...)`) become nodes.
+  - Calls are matched by exact name through imports, aliases, default
+    exports, re-exports, barrel files, `tsconfig` paths, CommonJS `require`,
+    Python relative imports and packages.
+  - Calls are never matched by substring and never across languages (both
+    produced many wrong edges before).
+  - Calls into libraries stay unresolved instead of being attached to an
+    unrelated project function.
+  - Resolution through class hierarchies, typed parameters, `self.attr` /
+    `this.attr` and constructor parameter properties.
+- **`codemap impact` compares each changed file with its version in `HEAD`
+  using the parsers**, instead of reading function names from diff hunk headers:
+  - Changed functions are the ones whose code actually changed, including added and deleted ones.
+  - Removed calls are calls a function no longer makes at all; they used to be
+    every call on a removed line, even when the line was only reformatted.
+  - Callers are looked up by node id, not by name.
+- Security-sensitive names are matched on whole words (`author` no longer matches `auth`).
+- Import analysis works on the syntax tree. "Missing" now means an import was
+  removed while the name is still used; the old regular expressions reported
+  most capitalized words (types, JSX, constants) as missing imports.
+- Indexing is several times faster: one transaction per file, cached SQL
+  statements, and the syntax tree is reused for data-flow analysis.
+  Large projects index in seconds instead of minutes.
+- The visualization server listens on 127.0.0.1 only.
+- MCP answers show paths relative to the project root, report when several
+  symbols share a name, and accept an optional `file` argument to pick one.
+- The `--version` output and the MCP server version come from `package.json`
+  (they were stuck at 3.6.0).
+- Requires Node.js 20 or newer (`better-sqlite3` 12, which supports Node 20-26).
+- The web app's libraries (React, React Flow, dagre, Tailwind helpers) are
+  build-time dependencies only, so installing codemap-ai downloads less.
+
+### Added
+- `codemap impact --json` (machine-readable result) and `--fail-on <level>`
+  (exit code 2 at or above a risk level, for CI).
+- `codemap impact` reports data-flow breaks: fields a function stopped
+  returning that its callers still read.
+- `codemap impact` reports removed access checks (`isAdmin()`, `verify_jwt()`...)
+  even when they are defined outside the indexed code.
+- `codemap visualize --port <n>` and `--no-open`. The server stops cleanly on Ctrl+C.
+- `codemap init --force`, which the code already checked for but the command did not accept.
+- `codemap index` remembers `--include` / `--exclude` patterns and removes
+  deleted or newly excluded files from the index.
+- `.mts`, `.cts`, `.mjs` and `.cjs` files are indexed. `.venv`,
+  `site-packages`, `coverage` and `*.min.js` are excluded by default.
+- FastAPI: routes on any router name (`api_router.get`), and `Depends()` inside `Annotated[...]`.
+- Library exports: `analyzeImpact`, `parserRegistry`, `VERSION`, `INDEX_FORMAT_VERSION`,
+  `FlowStorage.findSymbols()`.
+- Test suite (vitest) covering parsers, call resolution, incremental indexing,
+  impact analysis, the CLI and the MCP server. Also ESLint configuration,
+  GitHub Actions CI, `CONTRIBUTING.md`, `docs/ARCHITECTURE.md`, issue and pull
+  request templates, and `.editorconfig`.
+
+### Fixed
+- Parsing files larger than 32 KB failed silently for TypeScript/JavaScript, so
+  such files had no functions in the index.
+- Edge ids collided between files and languages, so edges overwrote each other.
+  Re-indexing a file left its old edges and data-flow rows behind, so stale
+  callers accumulated.
+- Edges from other files to a re-indexed file now re-attach to the new symbols.
+- The visualization drew no edges (graph nodes had no connection handles),
+  its node text was hard to read on the dark background, and functions that
+  lost a call never appeared in it.
+- `impact` crashed or misbehaved on deleted files, on file names with spaces or
+  shell characters (git was run through a shell), on single-line diff hunks,
+  in subdirectories of a repository, and before the first commit.
+- `impact` reported the `.codemap/` index itself as a changed file.
+- A missing index in the MCP server is reported as a tool error instead of failing every request.
+- A broken `docker-compose.yml` or Dockerfile no longer crashes `impact`. Entry
+  points are found relative to the build context and through
+  `HEALTHCHECK` / line continuations.
+- `codemap_impact` counted callers reached through several paths more than
+  once, and its `depth` went one level deeper than requested.
+
+### Removed
+- Unused code from the 0.x line that was no longer reachable from any command:
+  the old knowledge-graph builder, semantic indexer, skills generator, D3 web
+  page and old MCP server. Also backup files.
+
+## [3.8.0] - 2026-02-09
+
+### Changed
+- Package metadata cleanup (author, repository, homepage and issue links).
+- No code changes (the built files are identical to 3.7.0).
+
+---
+
 ## [3.7.0] - 2026-02-08
 
 ### Added
@@ -109,7 +216,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/web/app/lib/graph-layout.ts` - Layout integration
 - Production build: ~518KB JavaScript bundle
 - Development build time: ~1.2 seconds
-- Documentation: `docs/VISUALIZATION.md`
 
 ### Dependencies Added
 - Production: `@xyflow/react`, `elkjs`, `express`, `open`, `react`, `react-dom`
@@ -170,7 +276,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Return shape extraction: 85%+
 - Data flow validation: 85%+
 
-## [3.4.0] - 2025-02-09
+## [3.4.0] - 2026-02-08
 
 ### Added
 - **Enhanced Call Resolution** - Type-aware method resolution (Phase 2)
@@ -216,7 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Resolution Improvements
 ```bash
-# Before Phase 2 (v3.3.0):
+# Before Phase 2 (v3.2.0):
 Call resolution rate: 25%
 
 # After Phase 2 (v3.4.0):
@@ -237,9 +343,11 @@ When you remove a line like `handler.authenticate()`:
 
 **End-to-end accuracy: 85%+ (95% detection × 90% resolution)**
 
-## [3.3.0] - 2025-02-09
+### Line-level diff analysis (developed as 3.3.0, first published in 3.4.0)
 
-### Added
+Version 3.3.0 was never published to npm; its changes shipped in 3.4.0.
+
+#### Added
 - **Line-Level Diff Analysis** - Revolutionary removed function call detection (Phase 1)
   - **Removed Call Detection**: Detects when function calls are removed from code
   - **Impact Propagation**: Calculates full blast radius through call graph
@@ -251,24 +359,24 @@ When you remove a line like `handler.authenticate()`:
 - Calculate severity: CRITICAL (security functions), HIGH (orphaned/high-impact), MEDIUM/LOW
 - Enhanced CLI output showing removed calls with severity indicators
 
-### Changed
+#### Changed
 - Risk assessment now includes removed call severity
 - Impact analysis integrates line-level diff analysis with call graph
 - Total impact includes count of removed calls
 - CRITICAL risk level triggered by security function removals
 
-### Fixed
+#### Fixed
 - Silent breakages from removed validation/security calls now detected
 - Missing validation bypasses now flagged before deployment
 
-### Technical Details
+#### Technical Details
 - New modules: `src/analysis/line-diff.ts`, `src/analysis/removed-calls.ts`, `src/analysis/removed-call-impact.ts`
 - Parses git diff to extract removed lines with function context
 - Regex-based call extraction (supports JS/TS/Python)
 - Security keyword detection: authenticate, validate, authorize, token, sanitize, etc.
 - BFS traversal through call graph to calculate impact radius
 
-### Example Output
+#### Example Output
 ```bash
 🚨 Removed Function Calls:
 
@@ -283,7 +391,7 @@ Risk Assessment:
   ⚠️ DO NOT DEPLOY - Critical security issue detected
 ```
 
-## [3.2.0] - 2025-02-08
+## [3.2.0] - 2026-02-08
 
 ### Added
 - **System-Wide Impact Analysis** - Revolutionary multi-layer dependency tracking
@@ -327,13 +435,13 @@ Risk Assessment:
   🔴 CRITICAL - System-wide failure risk
 ```
 
-## [3.1.1] - 2025-02-08
+## [3.1.1] - 2026-02-08
 
 ### Fixed
 - Fixed `codemap impact` command failing with "no such column: file_path" error
 - Corrected SQL query in `getAllFileHashes()` to use correct column name `path` instead of `file_path`
 
-## [3.1.0] - 2025-02-08
+## [3.1.0] - 2026-02-08
 
 ### Added
 - **`codemap init`** - One-command setup that indexes + configures MCP server automatically
@@ -355,7 +463,7 @@ Risk Assessment:
 ### Fixed
 - None (new features)
 
-## [3.0.0] - 2025-02-07
+## [3.0.0] - 2026-02-08
 
 ### Added
 - Complete rewrite focused on call graph analysis
@@ -382,17 +490,32 @@ Risk Assessment:
 - Claude Code skills generation
 - Multiple unused commands
 
-## [0.2.0] - 2025-01-XX
+## [0.2.0] - 2026-02-06
 
 ### Added
-- Initial release with semantic indexing
-- Multiple MCP tools
-- Web visualization
-- Skills generation
+- `codemap init`: scan, generate Claude Code skills and add the MCP server in one command
 
 ### Known Issues
 - 7% accuracy on call resolution (improved to 25% in 3.0.0)
 - Complex setup process (simplified in 3.1.0)
+
+## [0.1.2] - 2026-02-06
+
+### Changed
+- `generate-skills` writes to `.claude/skills` by default (was `.claude/skills/codemap`)
+
+## [0.1.1] - 2026-02-06
+
+### Fixed
+- `codemap serve` could not find the web page when installed with npm or run with npx
+
+## [0.1.0] - 2026-02-06
+
+### Added
+- Initial release: knowledge graph of Python, TypeScript and JavaScript code
+  (`codemap scan`), Claude Code skills generation (`generate-skills`), impact
+  queries (`affected`), statistics (`stats`), a D3 web visualization (`serve`)
+  and an MCP server with multiple tools
 
 ---
 
@@ -417,7 +540,7 @@ codemap impact  # New: Check what changed before PR
 **What's changed:**
 - `codemap index` still works but use `codemap init` for first-time setup
 - New `codemap impact` command for pre-PR checks
-- MCP server auto-configured (no manual `claude mcp add` needed)
+- MCP server auto-configured by `codemap init` (since the Unreleased version it is written to the project's `.mcp.json`)
 
 ### From 0.2.0 to 3.0.0
 
@@ -430,9 +553,23 @@ This is a major breaking change with complete rewrite:
 
 **Migration steps:**
 1. Remove old `.codemap/` directory
-2. Run `npm install -g codemap-ai@3.1.0`
+2. Run `npm install -g codemap-ai@latest`
 3. Run `codemap init` in your project
 4. Update Claude Code MCP config (done automatically by `init`)
 
 ---
 
+[Unreleased]: https://github.com/svhozt/codemap-ai/compare/v3.8.0...HEAD
+[3.8.0]: https://www.npmjs.com/package/codemap-ai/v/3.8.0
+[3.7.0]: https://www.npmjs.com/package/codemap-ai/v/3.7.0
+[3.6.0]: https://www.npmjs.com/package/codemap-ai/v/3.6.0
+[3.5.0]: https://www.npmjs.com/package/codemap-ai/v/3.5.0
+[3.4.0]: https://www.npmjs.com/package/codemap-ai/v/3.4.0
+[3.2.0]: https://www.npmjs.com/package/codemap-ai/v/3.2.0
+[3.1.1]: https://www.npmjs.com/package/codemap-ai/v/3.1.1
+[3.1.0]: https://www.npmjs.com/package/codemap-ai/v/3.1.0
+[3.0.0]: https://www.npmjs.com/package/codemap-ai/v/3.0.0
+[0.2.0]: https://www.npmjs.com/package/codemap-ai/v/0.2.0
+[0.1.2]: https://www.npmjs.com/package/codemap-ai/v/0.1.2
+[0.1.1]: https://www.npmjs.com/package/codemap-ai/v/0.1.1
+[0.1.0]: https://www.npmjs.com/package/codemap-ai/v/0.1.0
