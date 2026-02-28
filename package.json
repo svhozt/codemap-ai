@@ -1,6 +1,6 @@
 {
   "name": "codemap-ai",
-  "version": "3.8.0",
+  "version": "4.0.0",
   "description": "Call graph analyzer for understanding code impact and execution flows - built for Claude Code",
   "type": "module",
   "main": "dist/index.js",

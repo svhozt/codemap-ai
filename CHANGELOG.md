@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This release prepares CodeMap for its open-source repository. CLI commands and
-options, MCP tool names and arguments, and the library exports are unchanged
-or extended. Indexes built by earlier versions are rebuilt automatically by
-`codemap index` / `impact`; until then the MCP tools ask for `codemap reindex`.
+## [4.0.0] - 2026-11-24
+
+CodeMap is now open source under the Apache License 2.0:
+https://github.com/svhozt/codemap-ai
+
+### Breaking changes
+- **Node.js 20 or newer is required** (was 18). The SQLite driver
+  (`better-sqlite3` 12) needs it, and Node 18 is end-of-life.
+- **`codemap init` registers the MCP server in the project's `.mcp.json`**
+  instead of `~/.claude/config.json` (see "Changed" below). Claude Code asks you
+  to approve the server the first time it starts in the project.
+
+CLI commands and options, MCP tool names and arguments, and the library
+exports are otherwise unchanged or extended. Indexes built by earlier versions
+are rebuilt automatically by `codemap index` / `impact`; until then the MCP
+tools ask for `codemap reindex`.
 
 ### Changed
 - **License: Apache License 2.0** (previously MIT). Added a `NOTICE` file.
@@ -559,7 +571,8 @@ This is a major breaking change with complete rewrite:
 
 ---
 
-[Unreleased]: https://github.com/svhozt/codemap-ai/compare/v3.8.0...HEAD
+[Unreleased]: https://github.com/svhozt/codemap-ai/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/svhozt/codemap-ai/compare/v3.8.0...v4.0.0
 [3.8.0]: https://www.npmjs.com/package/codemap-ai/v/3.8.0
 [3.7.0]: https://www.npmjs.com/package/codemap-ai/v/3.7.0
 [3.6.0]: https://www.npmjs.com/package/codemap-ai/v/3.6.0
